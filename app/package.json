@@ -1,0 +1,14 @@
+{
+  "name": "docker-status-api",
+  "version": "1.0.0",
+  "main": "server.js",
+  "type": "module",
+  "dependencies": {
+    "dockerode": "^4.0.2",
+    "express": "^4.22.1"
+  },
+  "description": "",
+  "scripts": {
+    "start": "node server.js"
+  }
+}
