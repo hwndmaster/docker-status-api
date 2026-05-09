@@ -1,14 +1,15 @@
 services:
   docker-status-api:
-    image: node:20-alpine
     container_name: docker-status-api
+    build: .
+    image: docker-status-api:local
+    pull_policy: build
     command: sh -c "cd /app && npm install --omit=dev && node server.js"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - ./app:/app
     ports:
       - "3000:3000"
-    network_mode: host
     env_file:
       - .env
     restart: unless-stopped

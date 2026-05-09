@@ -3,14 +3,19 @@ import http from "http";
 import https from "https";
 
 const app = express();
+app.use(express.json());
 
 /* ------------------------------------------------------------------ */
 /*  Config from environment                                           */
 /*                                                                    */
 /*  LOCAL_LABEL=nas                                                   */
 /*  REMOTE_SERVERS=windows=http://192.168.1.100:3000                  */
-/*  EXCLUDE_IMAGES=ghcr.io/hwndmaster,myregistry.io/internal          */
+/*  EXCLUDE_IMAGES=ghcr.io/immich-app/postgres                        */
+/*  EXCLUDE_NAMES=immich_postgres,some_other                          */
+/*  GHCR_TOKENS=ghcr.io/hwndmaster=ghp_yourtoken                      */
 /* ------------------------------------------------------------------ */
+
+const LOCAL_LABEL = process.env.LOCAL_LABEL || "nas";
 
 const REMOTE_SERVERS = (process.env.REMOTE_SERVERS || "")
   .split(",")
@@ -26,8 +31,46 @@ const EXCLUDE_IMAGES = (process.env.EXCLUDE_IMAGES || "")
   .map((s) => s.trim())
   .filter(Boolean);
 
-function isExcluded(image) {
-  return EXCLUDE_IMAGES.some((pattern) => image.includes(pattern));
+const EXCLUDE_NAMES = (process.env.EXCLUDE_NAMES || "")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
+
+// Tokens for private/authenticated GHCR namespaces.
+// Format: "ghcr.io/owner=token,ghcr.io/owner2=token2"
+const GHCR_TOKENS = (process.env.GHCR_TOKENS || "")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean)
+  .reduce((acc, s) => {
+    const eqIdx = s.indexOf("=");
+    acc[s.slice(0, eqIdx).toLowerCase()] = s.slice(eqIdx + 1);
+    return acc;
+  }, {});
+
+console.log("Config:");
+console.log(`  LOCAL_LABEL: ${LOCAL_LABEL}`);
+console.log(`  REMOTE_SERVERS: ${REMOTE_SERVERS.map((s) => `${s.label}=${s.url}`).join(", ") || "None"}`);
+console.log(`  EXCLUDE_IMAGES: ${EXCLUDE_IMAGES.join(", ") || "None"}`);
+console.log(`  EXCLUDE_NAMES: ${EXCLUDE_NAMES.join(", ") || "None"}`);
+console.log(`  GHCR_TOKENS: ${Object.keys(GHCR_TOKENS).join(", ") || "None"}`);
+
+function getGhcrToken(image) {
+  // Match longest prefix first, e.g. "ghcr.io/hwndmaster" before "ghcr.io"
+  const lower = image.toLowerCase();
+  const match = Object.keys(GHCR_TOKENS)
+    .sort((a, b) => b.length - a.length)
+    .find((prefix) => lower.startsWith(prefix));
+  return match ? GHCR_TOKENS[match] : null;
+}
+
+function isExcluded(image, containerName) {
+  // Strip digest before matching so "ghcr.io/foo/bar" matches
+  // "ghcr.io/foo/bar:tag@sha256:..." correctly
+  const imageNoDigest = image.split("@")[0];
+  if (EXCLUDE_IMAGES.some((pattern) => imageNoDigest.includes(pattern))) return true;
+  if (EXCLUDE_NAMES.some((n) => n === containerName)) return true;
+  return false;
 }
 
 /* ------------------------------------------------------------------ */
@@ -47,14 +90,23 @@ function setCachedTags(image, result) {
   tagCache.set(image, { result, expiresAt: Date.now() + CACHE_TTL_MS });
 }
 
+function clearCachedTags(image) {
+  tagCache.delete(image);
+}
+
 /* ------------------------------------------------------------------ */
 /*  Docker socket                                                     */
 /* ------------------------------------------------------------------ */
 
+const DOCKER_SOCKET = "/var/run/docker.sock";
+
+// GET helper kept for back-compat with callers that just want the parsed
+// JSON body. Doesn't enforce 2xx status codes — the daemon usually returns
+// JSON even for error responses, and existing callers cope.
 function dockerRequest(path) {
   return new Promise((resolve, reject) => {
     const req = http.request(
-      { socketPath: "/var/run/docker.sock", path, method: "GET" },
+      { socketPath: DOCKER_SOCKET, path, method: "GET" },
       (res) => {
         let data = "";
         res.on("data", (chunk) => (data += chunk));
@@ -64,6 +116,164 @@ function dockerRequest(path) {
           } catch (e) {
             reject(new Error(`Docker socket parse error: ${e.message}`));
           }
+        });
+      }
+    );
+    req.on("error", reject);
+    req.end();
+  });
+}
+
+// Generic Docker engine API call with strict status-code checking.
+// Returns parsed JSON on success, null for empty 2xx (e.g. 204 from /start).
+// Used for state-changing calls where a 304/4xx/5xx must surface as an error.
+function dockerApi(method, path, body = null, extraHeaders = {}) {
+  return new Promise((resolve, reject) => {
+    const data = body ? JSON.stringify(body) : null;
+    const headers = { ...extraHeaders };
+    if (data !== null) {
+      headers["Content-Type"] = "application/json";
+      headers["Content-Length"] = Buffer.byteLength(data);
+    }
+
+    const req = http.request(
+      { socketPath: DOCKER_SOCKET, path, method, headers },
+      (res) => {
+        let buf = "";
+        res.on("data", (chunk) => (buf += chunk));
+        res.on("end", () => {
+          if (res.statusCode >= 200 && res.statusCode < 300) {
+            if (!buf) return resolve(null);
+            try {
+              return resolve(JSON.parse(buf));
+            } catch {
+              return resolve(buf);
+            }
+          }
+          let detail = buf;
+          try {
+            detail = JSON.parse(buf).message || buf;
+          } catch {}
+          reject(
+            Object.assign(
+              new Error(`Docker ${method} ${path} → ${res.statusCode}: ${detail}`),
+              { statusCode: res.statusCode }
+            )
+          );
+        });
+      }
+    );
+    req.on("error", reject);
+    if (data !== null) req.write(data);
+    req.end();
+  });
+}
+
+// Split an image reference into the (name, tag) pair the /images/create
+// endpoint expects. Handles registries with ports correctly — e.g.
+// "registry:5000/foo:1.2" → name="registry:5000/foo", tag="1.2".
+function splitImageTag(image) {
+  const noDigest = image.split("@")[0];
+  const lastSlash = noDigest.lastIndexOf("/");
+  const tagPos = noDigest.indexOf(":", lastSlash + 1);
+  if (tagPos === -1) return { name: noDigest, tag: "latest" };
+  return { name: noDigest.slice(0, tagPos), tag: noDigest.slice(tagPos + 1) };
+}
+
+// Build the X-Registry-Auth header value for private-registry pulls.
+// Docker expects base64url(JSON) — URL-safe base64 of the credentials,
+// WITH padding (some daemon versions reject the unpadded form even though
+// it's technically valid base64url).
+function makeRegistryAuth(image, pat) {
+  if (!pat) return null;
+  const serveraddress = image.startsWith("ghcr.io/") ? "ghcr.io" : null;
+  if (!serveraddress) return null;
+  // GHCR accepts any non-empty username paired with a PAT as password,
+  // but the username most reliably understood across docker daemon
+  // versions is the owner extracted from the image path.
+  const owner = image.replace(/^ghcr\.io\//, "").split("/")[0] || "x-access-token";
+  const auth = JSON.stringify({
+    username: owner,
+    password: pat,
+    serveraddress,
+  });
+  return Buffer.from(auth)
+    .toString("base64")
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_");
+}
+
+// Stream-pull an image via POST /images/create. The response is a stream
+// of NDJSON status objects; the pull is complete when the stream closes.
+// Any object with an `error` field means the pull failed even if the
+// HTTP response itself was 200.
+function dockerPullImage(image, registryAuth) {
+  return new Promise((resolve, reject) => {
+    const { name, tag } = splitImageTag(image);
+    const path =
+      `/images/create?fromImage=${encodeURIComponent(name)}` +
+      `&tag=${encodeURIComponent(tag)}`;
+
+    const headers = {};
+    if (registryAuth) headers["X-Registry-Auth"] = registryAuth;
+
+    const req = http.request(
+      { socketPath: DOCKER_SOCKET, path, method: "POST", headers },
+      (res) => {
+        let buf = "";
+        const events = [];
+        let streamError = null;
+
+        res.on("data", (chunk) => {
+          buf += chunk.toString();
+          let nl;
+          while ((nl = buf.indexOf("\n")) !== -1) {
+            const line = buf.slice(0, nl).trim();
+            buf = buf.slice(nl + 1);
+            if (!line) continue;
+            try {
+              const obj = JSON.parse(line);
+              events.push(obj);
+              if (obj.error) streamError = obj.error;
+            } catch {
+              /* ignore non-JSON lines */
+            }
+          }
+        });
+        res.on("end", () => {
+          if (buf.trim()) {
+            try {
+              const obj = JSON.parse(buf);
+              events.push(obj);
+              if (obj.error) streamError = obj.error;
+            } catch {}
+          }
+
+          // The /images/create endpoint can fail in two distinct ways:
+          //  - HTTP 200 with an `{"error": "..."}` event somewhere in the
+          //    NDJSON stream (registry-side failure surfaced through the
+          //    streaming protocol — most "denied", "manifest unknown" etc.).
+          //  - Non-2xx HTTP status with a single JSON body usually shaped
+          //    like `{"message": "..."}` (daemon-side failure: bad auth
+          //    header parsing, DNS issue, daemon config, etc.).
+          // We collapse both into one error message so the caller sees
+          // something useful instead of just "HTTP 500".
+          const httpFailed = res.statusCode < 200 || res.statusCode >= 300;
+          if (streamError || httpFailed) {
+            const fromMessage = events.find((e) => e?.message)?.message;
+            const detail =
+              streamError ||
+              fromMessage ||
+              (events.length
+                ? JSON.stringify(events.slice(-3))
+                : "<empty body>");
+            return reject(
+              new Error(
+                `Pull failed for ${image} (HTTP ${res.statusCode}): ${detail}`
+              )
+            );
+          }
+          resolve(events);
         });
       }
     );
@@ -106,6 +316,44 @@ function httpsGet(url, headers = {}) {
 }
 
 /* ------------------------------------------------------------------ */
+/*  Generic HTTP POST helper (for proxying /update)                   */
+/* ------------------------------------------------------------------ */
+
+function httpPost(url) {
+  return new Promise((resolve, reject) => {
+    const parsed = new URL(url);
+
+    const req = http.request(
+      {
+        hostname: parsed.hostname,
+        port: parsed.port,
+        path: parsed.pathname + parsed.search,
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+      },
+      (res) => {
+        let data = "";
+        res.on("data", (chunk) => (data += chunk));
+        res.on("end", () => {
+          try {
+            resolve({ status: res.statusCode, body: JSON.parse(data) });
+          } catch (e) {
+            reject(new Error(`JSON parse error: ${e.message}`));
+          }
+        });
+      }
+    );
+
+    req.setTimeout(60000, () => {
+      req.destroy();
+      reject(new Error(`Timeout proxying update request to ${url}`));
+    });
+    req.on("error", reject);
+    req.end();
+  });
+}
+
+/* ------------------------------------------------------------------ */
 /*  Docker Hub                                                        */
 /* ------------------------------------------------------------------ */
 
@@ -120,18 +368,102 @@ async function fetchDockerHubTags(repo, name) {
 /*  GHCR                                                              */
 /* ------------------------------------------------------------------ */
 
-async function fetchGhcrToken(repo, name) {
+// Get an anonymous pull token for public GHCR repos.
+async function fetchGhcrAnonToken(repo, name) {
   const url = `https://ghcr.io/token?scope=repository:${repo}/${name}:pull&service=ghcr.io`;
   const { body } = await httpsGet(url);
   return body.token || body.access_token || null;
 }
 
-async function fetchGhcrTags(repo, name) {
-  const token = await fetchGhcrToken(repo, name);
+// Get a Bearer token using a PAT (for private repos or manifest access).
+// GHCR accepts PATs as password in Basic auth to exchange for a Bearer token.
+async function fetchGhcrBearerToken(repo, name, pat) {
+  const url = `https://ghcr.io/token?scope=repository:${repo}/${name}:pull&service=ghcr.io`;
+  const basic = Buffer.from(`x-access-token:${pat}`).toString("base64");
+  const { body } = await httpsGet(url, { Authorization: `Basic ${basic}` });
+  return body.token || body.access_token || null;
+}
+
+async function fetchGhcrTags(repo, name, pat = null) {
+  const token = pat
+    ? await fetchGhcrBearerToken(repo, name, pat)
+    : await fetchGhcrAnonToken(repo, name);
   if (!token) throw new Error(`Could not get GHCR token for ${repo}/${name}`);
   const url = `https://ghcr.io/v2/${repo}/${name}/tags/list`;
   const { body } = await httpsGet(url, { Authorization: `Bearer ${token}` });
   return body.tags || [];
+}
+
+// Fetch the creation timestamp of the latest manifest from GHCR.
+// Returns ISO 8601 truncated to seconds (e.g. "2026-05-07T09:06:30") or null.
+// Used for date-based images (e.g. personal repos without semver tags) where
+// multiple builds per day need to be distinguishable.
+//
+// Resolution order:
+//   1. OCI annotation on the manifest (cheap; depends on build pipeline)
+//   2. `created` field inside the image's config blob (always set by buildkit)
+async function fetchGhcrLatestCreated(repo, name, pat) {
+  const token = await fetchGhcrBearerToken(repo, name, pat);
+  if (!token) throw new Error(`Could not get GHCR token for ${repo}/${name}`);
+
+  // Accept both single image manifests AND image indexes (multi-arch lists),
+  // otherwise multi-arch images return 404 with the wrong Accept header.
+  const acceptManifest = [
+    "application/vnd.oci.image.manifest.v1+json",
+    "application/vnd.docker.distribution.manifest.v2+json",
+    "application/vnd.oci.image.index.v1+json",
+    "application/vnd.docker.distribution.manifest.list.v2+json",
+  ].join(",");
+
+  const manifestUrl = `https://ghcr.io/v2/${repo}/${name}/manifests/latest`;
+  const { body: top } = await httpsGet(manifestUrl, {
+    Authorization: `Bearer ${token}`,
+    Accept: acceptManifest,
+  });
+
+  // If we got back a manifest list / image index, follow it to one
+  // platform-specific manifest before reading any annotations or the config.
+  let manifest = top;
+  if (Array.isArray(top?.manifests) && top.manifests.length > 0) {
+    const pick =
+      top.manifests.find(
+        (m) =>
+          m.platform &&
+          m.platform.os === "linux" &&
+          m.platform.architecture === "amd64"
+      ) ||
+      top.manifests.find(
+        (m) => m.platform && m.platform.architecture && m.platform.architecture !== "unknown"
+      ) ||
+      top.manifests[0];
+
+    const { body: inner } = await httpsGet(
+      `https://ghcr.io/v2/${repo}/${name}/manifests/${pick.digest}`,
+      { Authorization: `Bearer ${token}`, Accept: acceptManifest }
+    );
+    manifest = inner;
+  }
+
+  // 1) OCI annotation on the image manifest (cheapest path).
+  const annotation = manifest?.annotations?.["org.opencontainers.image.created"];
+  if (annotation) return annotation.slice(0, 19);
+
+  // 2) Fetch the config blob — its `created` field is set by Docker buildkit
+  //    on every build, so this is the reliable fallback.
+  const configDigest = manifest?.config?.digest;
+  if (!configDigest) return null;
+
+  const { body: config } = await httpsGet(
+    `https://ghcr.io/v2/${repo}/${name}/blobs/${configDigest}`,
+    { Authorization: `Bearer ${token}`, Accept: "application/vnd.oci.image.config.v1+json,application/vnd.docker.container.image.v1+json,application/json" }
+  );
+
+  const created =
+    config?.created ||
+    config?.config?.Labels?.["org.opencontainers.image.created"] ||
+    null;
+
+  return created ? created.slice(0, 19) : null;
 }
 
 /* ------------------------------------------------------------------ */
@@ -238,24 +570,52 @@ async function getImageInfo(imageId) {
   }
 }
 
-function extractVersionFromLabels(imageInfo) {
+function extractVersionFromLabels(imageInfo, skipOciVersion = false) {
   const labels = imageInfo?.Config?.Labels ?? {};
-  const version =
-    labels["org.opencontainers.image.version"] ||
-    labels["org.label-schema.version"] ||
-    labels["version"] ||
-    null;
+  const version = skipOciVersion
+    ? labels["org.label-schema.version"] || labels["version"] || null
+    : labels["org.opencontainers.image.version"] ||
+      labels["org.label-schema.version"] ||
+      labels["version"] ||
+      null;
   // Ignore label if author wrote "latest" or similar as version
   if (version && NON_VERSION_TAGS.has(version.toLowerCase())) return null;
   return version;
 }
 
-// Fallback: use image creation date as version (YYYY-MM-DD).
-// Useful for projects like metube that use date-based tags but don't set labels.
-function extractDateFromImageInfo(imageInfo) {
+// Fallback: use image creation timestamp as version, truncated to seconds
+// (e.g. "2026-04-28T19:05:54"). Truncating to the date alone collapses
+// multiple same-day builds to the same version, which makes them look
+// identical in the UI and breaks the "is the remote newer?" comparison.
+// Useful for projects like metube — and any private repo that ships
+// multiple builds per day under :latest — where date-based tags are used
+// but no semver label is set.
+function extractCreatedFromImageInfo(imageInfo) {
   const created = imageInfo?.Created; // e.g. "2026-04-28T19:05:54.350040342Z"
   if (!created) return null;
-  return created.slice(0, 10); // → "2026-04-28"
+  return created.slice(0, 19); // → "2026-04-28T19:05:54"
+}
+
+function extractComposeDir(containerLabels, imageInfo) {
+  const imageLabels = imageInfo?.Config?.Labels ?? {};
+
+  // 1) Explicit override label. Set on the container (preferred, via
+  //    `services.X.labels` in compose) or baked into the image. This wins
+  //    over the standard compose label, because the whole point of adding
+  //    the override is to provide a path that THIS container can chdir
+  //    into — typically a Linux-form path like "/c/Docker/foo" — instead
+  //    of the host-native "C:\\Docker\\foo" that Compose v2 records.
+  const override =
+    containerLabels?.["com.docker-status-api.compose-dir"] ||
+    imageLabels["com.docker-status-api.compose-dir"];
+  if (override) return override;
+
+  // 2) Standard compose label — present on all compose containers, but
+  //    written in host-native form (e.g. "C:\\Docker\\foo" on Windows),
+  //    which is generally not directly usable as cwd from inside this
+  //    Linux container. Prefer the override above when paths need
+  //    translating.
+  return containerLabels?.["com.docker.compose.project.working_dir"] || null;
 }
 
 /* ------------------------------------------------------------------ */
@@ -273,7 +633,8 @@ async function getLatestVersionTag(image, installedVersion) {
 
   if (registry === "ghcr") {
     const { repo, name } = parseGhcrImage(image);
-    tags = await fetchGhcrTags(repo, name);
+    const pat = getGhcrToken(image);
+    tags = await fetchGhcrTags(repo, name, pat);
   } else {
     const { repo, name } = parseDockerHubImage(image);
     tags = await fetchDockerHubTags(repo, name);
@@ -302,27 +663,40 @@ async function resolveContainer(c) {
   const name = c.Names[0].replace(/^\//, "");
   const image = c.Image;
   const tagVersion = extractTag(image);
+  const pat = getGhcrToken(image);
 
   console.log(`[resolve] ${name}: image=${image}, tagVersion=${tagVersion}, isVersionTag=${isVersionTag(tagVersion)}`);
 
+  const imageInfo = await getImageInfo(c.ImageID);
+
+  // Updates work via the Docker engine API (pull + recreate) so we can
+  // refresh anything that's referenced by tag — no compose dir / file
+  // access required. Only digest-pinned images can't be updated, since
+  // there's nothing newer to pull for an immutable reference.
+  const updatable = !image.startsWith("sha256:") && !image.includes("@sha256:");
+
   let installedVersion = tagVersion;
-  let installedFromDate = false;
+  let installedFromCreated = false;
 
   if (!isVersionTag(tagVersion)) {
-    const imageInfo = await getImageInfo(c.ImageID);
     console.log(`[resolve] ${name}: created=${imageInfo?.Created}, labels=${JSON.stringify(imageInfo?.Config?.Labels)}`);
 
-    const labelVersion = extractVersionFromLabels(imageInfo);
+    // For GHCR images with a PAT, skip org.opencontainers.image.version —
+    // these repos often carry a base image version (e.g. "24.04") rather
+    // than the actual app version. Fall straight through to timestamp-based.
+    const skipOci = image.startsWith("ghcr.io/") && pat !== null;
+    const labelVersion = extractVersionFromLabels(imageInfo, skipOci);
+
     if (labelVersion) {
       installedVersion = labelVersion;
       console.log(`[resolve] ${name}: installedVersion=${installedVersion} (from label)`);
     } else {
-      const dateVersion = extractDateFromImageInfo(imageInfo);
-      console.log(`[resolve] ${name}: dateVersion=${dateVersion}`);
-      if (dateVersion) {
-        installedVersion = dateVersion;
-        installedFromDate = true;
-        console.log(`[resolve] ${name}: installedVersion=${installedVersion} (from creation date)`);
+      const createdVersion = extractCreatedFromImageInfo(imageInfo);
+      console.log(`[resolve] ${name}: createdVersion=${createdVersion}`);
+      if (createdVersion) {
+        installedVersion = createdVersion;
+        installedFromCreated = true;
+        console.log(`[resolve] ${name}: installedVersion=${installedVersion} (from creation timestamp)`);
       }
     }
   }
@@ -332,17 +706,27 @@ async function resolveContainer(c) {
   let error = null;
 
   try {
-    // If version was derived from image creation date we can't reliably compare
-    // it against registry tags (different formats), so skip the check.
-    const latest = installedFromDate
-      ? null
-      : await getLatestVersionTag(image, installedVersion);
+    if (installedFromCreated && image.startsWith("ghcr.io/") && pat) {
+      // Timestamp-based GHCR image with PAT — compare manifest creation timestamp
+      const { repo, name: imgName } = parseGhcrImage(image);
+      const remoteCreated = await fetchGhcrLatestCreated(repo, imgName, pat);
+      console.log(`[resolve] ${name}: remoteCreated=${remoteCreated}, installedCreated=${installedVersion}`);
+      if (remoteCreated) {
+        latestVersion = remoteCreated;
+        // ISO 8601 strings sort lexicographically, so > works as expected.
+        updateAvailable = remoteCreated > installedVersion;
+      }
+    } else {
+      const latest = installedFromCreated
+        ? null
+        : await getLatestVersionTag(image, installedVersion);
 
-    console.log(`[resolve] ${name}: pattern=${guessTagPattern(installedVersion)}, latestFound=${latest}`);
+      console.log(`[resolve] ${name}: pattern=${guessTagPattern(installedVersion)}, latestFound=${latest}`);
 
-    if (latest) {
-      latestVersion = latest;
-      updateAvailable = normalizeTag(latest) !== normalizeTag(installedVersion);
+      if (latest) {
+        latestVersion = latest;
+        updateAvailable = normalizeTag(latest) !== normalizeTag(installedVersion);
+      }
     }
   } catch (e) {
     console.error(`[version-check] ${image}: ${e.message}`);
@@ -356,6 +740,7 @@ async function resolveContainer(c) {
     currentVersion: installedVersion,
     latestVersion,
     updateAvailable,
+    canUpdate: updatable,
     ...(error && { versionCheckError: error }),
   };
 }
@@ -372,7 +757,7 @@ function fetchRemoteContainers(server) {
     const req = proto.request(
       {
         hostname: url.hostname,
-        port: url.port || (url.protocol === "https:" ? 443 : 80),
+        port: url.port,
         path: url.pathname,
         method: "GET",
       },
@@ -408,7 +793,10 @@ function fetchRemoteContainers(server) {
 app.get("/containers", async (req, res) => {
   try {
     const raw = await dockerRequest("/containers/json");
-    const filtered = raw.filter((c) => !isExcluded(c.Image));
+    const filtered = raw.filter((c) => {
+      const name = c.Names[0].replace(/^\//, "");
+      return !isExcluded(c.Image, name);
+    });
     const containers = await Promise.all(filtered.map(resolveContainer));
     res.json({ containers });
   } catch (err) {
@@ -422,11 +810,12 @@ app.get("/containers", async (req, res) => {
 /* ------------------------------------------------------------------ */
 
 app.get("/all-containers", async (req, res) => {
-  const LOCAL_LABEL = process.env.LOCAL_LABEL || "nas";
-
   async function fetchLocal() {
     const raw = await dockerRequest("/containers/json");
-    const filtered = raw.filter((c) => !isExcluded(c.Image));
+    const filtered = raw.filter((c) => {
+      const name = c.Names[0].replace(/^\//, "");
+      return !isExcluded(c.Image, name);
+    });
     const containers = await Promise.all(filtered.map(resolveContainer));
     return containers.map((c) => ({ ...c, server: LOCAL_LABEL }));
   }
@@ -459,6 +848,298 @@ app.get("/all-containers", async (req, res) => {
 });
 
 /* ------------------------------------------------------------------ */
+/*  /update/:name — pull + restart a container via docker compose     */
+/* ------------------------------------------------------------------ */
+
+app.post("/update/:name", async (req, res) => {
+  const { name } = req.params;
+  const { server } = req.query; // ?server=nas or ?server=windows
+
+  // If targeted at a remote server — proxy the request
+  if (server && server !== LOCAL_LABEL) {
+    const remote = REMOTE_SERVERS.find((s) => s.label === server);
+    if (!remote) {
+      return res.status(404).json({ error: `Unknown server: ${server}` });
+    }
+    try {
+      console.log(`[update] Proxying update of ${name} to ${remote.label} (${remote.url})`);
+      const { status, body } = await httpPost(`${remote.url}/update/${encodeURIComponent(name)}`);
+      return res.status(status).json(body);
+    } catch (e) {
+      return res.status(502).json({ error: `Failed to proxy update to ${remote.label}: ${e.message}` });
+    }
+  }
+
+  // Local update — Watchtower-style: pull the image via the Docker engine
+  // API, then if the digest changed, recreate the container in place using
+  // its existing Config + HostConfig + network attachments. No filesystem
+  // access to the project's compose tree is required: the daemon socket is
+  // the entire interface.
+  const force = req.query.force === "1" || req.query.force === "true";
+
+  try {
+    const containers = await dockerRequest("/containers/json");
+    const c = containers.find((c) =>
+      c.Names.some((n) => n.replace(/^\//, "") === name)
+    );
+    if (!c) return res.status(404).json({ error: `Container not found: ${name}` });
+
+    // Inspect the current container so we have its full config to recreate
+    // with — env vars, ports, mounts, restart policy, networks, labels, etc.
+    const inspect = await dockerRequest(`/containers/${c.Id}/json`);
+    const image = inspect.Config.Image;
+
+    if (image.startsWith("sha256:") || image.includes("@sha256:")) {
+      return res.status(400).json({
+        error: `Container ${name} pins an image by digest (${image}); ` +
+          `there's no newer version to pull. Re-create it with a tag instead.`,
+      });
+    }
+
+    // 1) Pull the image. For private GHCR repos we authenticate with the
+    //    same PAT used elsewhere in this server.
+    const pat = getGhcrToken(image);
+    const auth = makeRegistryAuth(image, pat);
+    console.log(`[update] ${name}: pulling ${image}${auth ? " (with auth)" : ""}`);
+    await dockerPullImage(image, auth);
+
+    // 2) Resolve the freshly-pulled tag to its image ID. If it matches the
+    //    one the running container is using, there's nothing to do.
+    const newImage = await dockerRequest(`/images/${encodeURIComponent(image)}/json`);
+    const newImageId = newImage?.Id;
+    const oldImageId = inspect.Image;
+
+    if (newImageId && newImageId === oldImageId && !force) {
+      console.log(`[update] ${name}: already on ${newImageId.slice(7, 19)}, no recreate`);
+      clearCachedTags(image);
+      return res.json({
+        ok: true,
+        name,
+        recreated: false,
+        imageId: newImageId,
+        message: "Image already up to date — container left as-is.",
+      });
+    }
+
+    // 3) Stop the old container (skip if it's not running anyway), then
+    //    remove it. We free the name so the new container can claim it.
+    if (inspect.State?.Running) {
+      console.log(`[update] ${name}: stopping ${c.Id.slice(0, 12)}`);
+      await dockerApi("POST", `/containers/${c.Id}/stop?t=10`);
+    }
+    console.log(`[update] ${name}: removing ${c.Id.slice(0, 12)}`);
+    await dockerApi("DELETE", `/containers/${c.Id}?v=false`);
+
+    // 4) Build the create body from the inspect data. Docker only allows
+    //    one network in NetworkingConfig.EndpointsConfig at create time,
+    //    so we pick the first and connect to any others after creation.
+    const networks = inspect.NetworkSettings?.Networks ?? {};
+    const networkNames = Object.keys(networks);
+    const firstNetwork = networkNames[0];
+
+    const createBody = {
+      ...inspect.Config,
+      HostConfig: inspect.HostConfig,
+    };
+    if (firstNetwork) {
+      createBody.NetworkingConfig = {
+        EndpointsConfig: { [firstNetwork]: networks[firstNetwork] },
+      };
+    }
+
+    console.log(`[update] ${name}: creating new container`);
+    const created = await dockerApi(
+      "POST",
+      `/containers/create?name=${encodeURIComponent(name)}`,
+      createBody
+    );
+    const newId = created.Id;
+
+    // 5) Connect remaining networks (compose stacks rarely have more than
+    //    one, but we handle it for completeness).
+    for (let i = 1; i < networkNames.length; i++) {
+      const netName = networkNames[i];
+      console.log(`[update] ${name}: connecting to network ${netName}`);
+      await dockerApi(
+        "POST",
+        `/networks/${encodeURIComponent(netName)}/connect`,
+        { Container: newId, EndpointConfig: networks[netName] }
+      );
+    }
+
+    // 6) Start it.
+    console.log(`[update] ${name}: starting ${newId.slice(0, 12)}`);
+    await dockerApi("POST", `/containers/${newId}/start`);
+
+    clearCachedTags(image);
+
+    return res.json({
+      ok: true,
+      name,
+      recreated: true,
+      oldImageId,
+      newImageId,
+      newContainerId: newId,
+    });
+  } catch (e) {
+    console.error(`[update] ${name}: ${e.message}`);
+    return res.status(500).json({ error: e.message });
+  }
+});
+
+/* ------------------------------------------------------------------ */
+/*  /dashboard — inline HTML widget for Dashy iframe                  */
+/* ------------------------------------------------------------------ */
+
+app.get("/dashboard", (req, res) => {
+  res.send(`<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: sans-serif; font-size: 13px; background: transparent; color: #e0e0e0; padding: 12px; }
+    table { width: 100%; border-collapse: collapse; }
+    th { text-align: left; padding: 6px 8px; color: #888; font-weight: normal; border-bottom: 1px solid #333; }
+    td { padding: 6px 8px; border-bottom: 1px solid #222; vertical-align: middle; }
+    tr:hover td { background: #ffffff08; }
+    .server { color: #7a8fff; font-size: 11px; margin-top: 2px; }
+    .ok { color: #4caf50; }
+    .update-badge { color: #ff9800; font-weight: bold; }
+    .btn-update {
+      background: #ff9800;
+      color: #000;
+      border: none;
+      border-radius: 4px;
+      padding: 3px 10px;
+      font-size: 12px;
+      cursor: pointer;
+      font-weight: bold;
+    }
+    .btn-update:disabled {
+      background: #555;
+      color: #888;
+      cursor: not-allowed;
+    }
+    .spinner { display: inline-block; animation: spin 1s linear infinite; }
+    @keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
+    .toast {
+      position: fixed; bottom: 12px; left: 50%; transform: translateX(-50%);
+      background: #333; color: #fff; padding: 8px 16px; border-radius: 6px;
+      font-size: 12px; opacity: 0; transition: opacity 0.3s;
+      pointer-events: none;
+    }
+    .toast.show { opacity: 1; }
+    .toast.error { background: #c62828; }
+
+    .version {
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      width: 200px;
+      display: inline-block;
+    }
+  </style>
+</head>
+<body>
+  <table>
+    <thead>
+      <tr>
+        <th>Container</th>
+        <th>Current</th>
+        <th>Latest</th>
+        <th>Update</th>
+      </tr>
+    </thead>
+    <tbody id="tbody"><tr><td colspan="4" style="color:#555;padding:8px">Loading...</td></tr></tbody>
+  </table>
+  <div class="toast" id="toast"></div>
+
+  <script>
+    const API_BASE = '';
+
+    function showToast(msg, isError = false) {
+      const t = document.getElementById('toast');
+      t.textContent = msg;
+      t.className = 'toast show' + (isError ? ' error' : '');
+      setTimeout(() => t.className = 'toast', 3000);
+    }
+
+    function renderRow(c) {
+      const tr = document.createElement('tr');
+      tr.id = 'row-' + c.name + '-' + c.server;
+
+      const updateCell = c.updateAvailable
+        ? c.canUpdate
+          ? \`<button class="btn-update" onclick="doUpdate('\${c.name}', '\${c.server}', this)">↑ Update</button>\`
+          : \`<span class="update-badge">↑ Yes</span>\`
+        : \`<span class="ok">✓</span>\`;
+
+      tr.innerHTML = \`
+        <td>
+          <div>\${c.name}</div>
+          <div class="server">\${c.server}</div>
+        </td>
+        <td><div class='version'>\${c.currentVersion}</div></td>
+        <td><div class='version'>\${c.latestVersion}</div></td>
+        <td>\${updateCell}</td>
+      \`;
+      return tr;
+    }
+
+    function loadContainers() {
+      fetch(API_BASE + '/all-containers')
+        .then(r => r.json())
+        .then(data => {
+          const tbody = document.getElementById('tbody');
+          tbody.innerHTML = '';
+          const sorted = data.containers.slice().sort((a, b) => {
+            if (a.updateAvailable === b.updateAvailable) return 0;
+            return a.updateAvailable ? -1 : 1;
+          });
+          sorted.forEach(c => tbody.appendChild(renderRow(c)));
+        })
+        .catch(e => {
+          document.getElementById('tbody').innerHTML =
+            \`<tr><td colspan="4" style="color:#f44336;padding:8px">Error: \${e.message}</td></tr>\`;
+        });
+    }
+
+    async function doUpdate(name, server, btn) {
+      btn.disabled = true;
+      btn.innerHTML = '<span class="spinner">⟳</span> Updating...';
+
+      try {
+        const res = await fetch(\`\${API_BASE}/update/\${encodeURIComponent(name)}?server=\${encodeURIComponent(server)}\`, {
+          method: 'POST',
+        });
+        const data = await res.json();
+
+        if (!res.ok) {
+          showToast('Error: ' + (data.error || res.statusText), true);
+          btn.disabled = false;
+          btn.innerHTML = '↑ Update';
+          return;
+        }
+
+        showToast(\`\${name} updated successfully\`);
+
+        // Small delay to let Docker settle after restart
+        setTimeout(loadContainers, 2000);
+      } catch (e) {
+        showToast('Error: ' + e.message, true);
+        btn.disabled = false;
+        btn.innerHTML = '↑ Update';
+      }
+    }
+
+    loadContainers();
+  </script>
+</body>
+</html>`);
+});
+
+/* ------------------------------------------------------------------ */
 /*  /debug/:name — inspect image info for a container by name         */
 /* ------------------------------------------------------------------ */
 
@@ -475,69 +1156,14 @@ app.get("/debug/:name", async (req, res) => {
       containerName: req.params.name,
       imageId: c.ImageID,
       imageName: c.Image,
+      containerLabels: c.Labels ?? {},   // labels of the container
+      imageLabels: imageInfo?.Config?.Labels ?? {},  // labels of the image
       created: imageInfo?.Created,
-      labels: imageInfo?.Config?.Labels ?? {},
+      composeDir: extractComposeDir(c.Labels, imageInfo),
     });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
-});
-
-app.get("/dashboard", (req, res) => {
-  res.send(`<!DOCTYPE html>
-<html>
-<head>
-  <meta charset="utf-8">
-  <style>
-    * { box-sizing: border-box; margin: 0; padding: 0; }
-    body { font-family: sans-serif; font-size: 13px; background: #1a1a2e; color: #e0e0e0; padding: 12px; }
-    table { width: 100%; border-collapse: collapse; }
-    th { text-align: left; padding: 6px 8px; color: #888; font-weight: normal; border-bottom: 1px solid #333; }
-    td { padding: 6px 8px; border-bottom: 1px solid #222; }
-    tr:hover td { background: #ffffff08; }
-    .server { color: #7a8fff; font-size: 11px; }
-    .up { color: #4caf50; }
-    .update { color: #ff9800; font-weight: bold; }
-    .ok { color: #4caf50; }
-    .error { color: #f44336; padding: 8px; }
-  </style>
-</head>
-<body>
-  <table>
-    <thead>
-      <tr>
-        <th>Container</th>
-        <th>Current</th>
-        <th>Latest</th>
-        <th>Update</th>
-      </tr>
-    </thead>
-    <tbody id="tbody"><tr><td colspan="4" style="color:#555">Loading...</td></tr></tbody>
-  </table>
-  <script>
-    fetch('/all-containers')
-      .then(r => r.json())
-      .then(data => {
-        const rows = data.containers.map(c => \`
-          <tr>
-            <td>
-              <div>\${c.name}</div>
-              <div class="server">\${c.server}</div>
-            </td>
-            <td>\${c.currentVersion}</td>
-            <td>\${c.latestVersion}</td>
-            <td class="\${c.updateAvailable ? 'update' : 'ok'}">\${c.updateAvailable ? '↑ Yes' : '✓'}</td>
-          </tr>
-        \`).join('');
-        document.getElementById('tbody').innerHTML = rows;
-      })
-      .catch(e => {
-        document.getElementById('tbody').innerHTML =
-          \`<tr><td colspan="4" class="error">Error: \${e.message}</td></tr>\`;
-      });
-  </script>
-</body>
-</html>`);
 });
 
 /* ------------------------------------------------------------------ */
@@ -546,7 +1172,7 @@ app.get("/dashboard", (req, res) => {
 
 app.listen(3000, () => {
   console.log("Docker Status API running on port 3000");
-  console.log(`Local label: ${process.env.LOCAL_LABEL || "nas"}`);
+  console.log(`Local label: ${LOCAL_LABEL}`);
   if (REMOTE_SERVERS.length > 0) {
     console.log("Remote servers:", REMOTE_SERVERS.map((s) => `${s.label}=${s.url}`).join(", "));
   } else {
