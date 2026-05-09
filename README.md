@@ -1,2 +1,2 @@
 # docker-status-api
-Dashy widget for showing docker containers with their status
+A Vibe-code driven Dashy widget for showing docker containers with their status and update functionality.

@@ -357,11 +357,15 @@ function httpPost(url) {
 /*  Docker Hub                                                        */
 /* ------------------------------------------------------------------ */
 
+// Returns [{ name, digest }] where `digest` is the manifest-list digest
+// the tag points to (or null if the registry didn't supply one). The
+// digest is what we match against the local image's RepoDigest to refine
+// installed-version detection — see findCurrentVersionByDigest.
 async function fetchDockerHubTags(repo, name) {
   const url = `https://hub.docker.com/v2/repositories/${repo}/${name}/tags?page_size=100&ordering=last_updated`;
   const { body } = await httpsGet(url);
   if (!Array.isArray(body.results)) return [];
-  return body.results.map((t) => t.name);
+  return body.results.map((t) => ({ name: t.name, digest: t.digest || null }));
 }
 
 /* ------------------------------------------------------------------ */
@@ -391,7 +395,11 @@ async function fetchGhcrTags(repo, name, pat = null) {
   if (!token) throw new Error(`Could not get GHCR token for ${repo}/${name}`);
   const url = `https://ghcr.io/v2/${repo}/${name}/tags/list`;
   const { body } = await httpsGet(url, { Authorization: `Bearer ${token}` });
-  return body.tags || [];
+  // GHCR's tags/list only returns names. Fetching the manifest digest
+  // for each tag would require N extra round-trips, so we leave digest
+  // null and skip digest-based refinement for GHCR images. They tend to
+  // use precise version tags (or the timestamp fallback) anyway.
+  return (body.tags || []).map((n) => ({ name: n, digest: null }));
 }
 
 // Fetch the creation timestamp of the latest manifest from GHCR.
@@ -622,15 +630,18 @@ function extractComposeDir(containerLabels, imageInfo) {
 /*  Tag resolution                                                    */
 /* ------------------------------------------------------------------ */
 
-async function getLatestVersionTag(image, installedVersion) {
-  if (hasDigest(image)) return null;
+// Fetch (and cache) the registry's tag list for an image as
+// [{ name, digest }]. Caching is per image because different tag lookups
+// for the same image (latest-detection, current-version refinement) can
+// share the same fetched list.
+async function getRegistryTags(image) {
+  if (hasDigest(image)) return [];
 
   const cached = getCachedTags(image);
   if (cached !== undefined) return cached;
 
   const registry = detectRegistry(image);
   let tags = [];
-
   if (registry === "ghcr") {
     const { repo, name } = parseGhcrImage(image);
     const pat = getGhcrToken(image);
@@ -639,20 +650,64 @@ async function getLatestVersionTag(image, installedVersion) {
     const { repo, name } = parseDockerHubImage(image);
     tags = await fetchDockerHubTags(repo, name);
   }
+  setCachedTags(image, tags);
+  return tags;
+}
 
+// Pure: pick the highest-versioned tag that matches the same versioning
+// pattern as the installed one (so we don't compare 1.2.3 to 20240501).
+function findLatestVersionTag(tags, installedVersion) {
   const pattern = guessTagPattern(installedVersion);
-
-  const versionTags = tags
-    .filter((t) => {
-      if (!isVersionTag(t)) return false;
-      if (pattern !== "unknown" && guessTagPattern(t) !== pattern) return false;
-      return true;
-    })
+  const candidates = tags
+    .filter((t) => isVersionTag(t.name))
+    .filter((t) => pattern === "unknown" || guessTagPattern(t.name) === pattern)
+    .map((t) => t.name)
     .sort(compareVersions);
+  return candidates.length > 0 ? candidates[0] : null;
+}
 
-  const result = versionTags.length > 0 ? versionTags[0] : null;
-  setCachedTags(image, result);
-  return result;
+// Read the local image's manifest-list (or per-platform manifest) digest
+// out of `RepoDigests`. That's the same digest a registry exposes per
+// tag, so it's the linker between "what we have on disk" and "which tag
+// names point to it".
+function extractRepoDigest(imageInfo, image) {
+  const repoDigests = imageInfo?.RepoDigests || [];
+  if (repoDigests.length === 0) return null;
+
+  // Strip tag and digest off the image reference to get just the repo.
+  const noDigest = image.split("@")[0];
+  const lastSlash = noDigest.lastIndexOf("/");
+  const colonAfterSlash = noDigest.indexOf(":", lastSlash + 1);
+  const repo = colonAfterSlash === -1 ? noDigest : noDigest.slice(0, colonAfterSlash);
+
+  const match = repoDigests.find((rd) => rd.startsWith(repo + "@")) || repoDigests[0];
+  const atPos = match.lastIndexOf("@");
+  return atPos !== -1 ? match.slice(atPos + 1) : null;
+}
+
+// Pure: from a list of tags with digests, return the most specific
+// version-shaped tag that points to `localDigest`. "Most specific" =
+// most version components (e.g. "4.0.6" beats "4.0" beats "4"); on a
+// tie, the longer string (so "v4.0.6" beats "4.0.6" only if a maintainer
+// publishes both, which is fine — they're equivalent labels for us).
+//
+// Returns null when the registry didn't expose digests (GHCR), the local
+// image has no RepoDigest (locally-built), or no matching tag exists.
+function findCurrentVersionByDigest(tags, localDigest) {
+  if (!localDigest) return null;
+
+  const matches = tags.filter(
+    (t) => t.digest && t.digest === localDigest && isVersionTag(t.name)
+  );
+  if (matches.length === 0) return null;
+
+  matches.sort((a, b) => {
+    const lenA = parseVersion(a.name).length;
+    const lenB = parseVersion(b.name).length;
+    if (lenA !== lenB) return lenB - lenA;
+    return b.name.length - a.name.length;
+  });
+  return matches[0].name;
 }
 
 /* ------------------------------------------------------------------ */
@@ -716,11 +771,24 @@ async function resolveContainer(c) {
         // ISO 8601 strings sort lexicographically, so > works as expected.
         updateAvailable = remoteCreated > installedVersion;
       }
-    } else {
-      const latest = installedFromCreated
-        ? null
-        : await getLatestVersionTag(image, installedVersion);
+    } else if (!installedFromCreated && !hasDigest(image)) {
+      // Tag-based comparison. Fetch tags once and use the same list for
+      // both the installed-version refinement and the latest-version
+      // lookup — they share a cache so this is one network call.
+      const tags = await getRegistryTags(image);
 
+      // Refine `installedVersion` if the registry tells us a more specific
+      // tag points to our local image. Catches cases like Dashy where the
+      // OCI label is "4.0" but the tag pointing to that exact digest is
+      // "4.0.6".
+      const localDigest = extractRepoDigest(imageInfo, image);
+      const refined = findCurrentVersionByDigest(tags, localDigest);
+      if (refined && refined !== installedVersion) {
+        console.log(`[resolve] ${name}: refined ${installedVersion} → ${refined} via digest match`);
+        installedVersion = refined;
+      }
+
+      const latest = findLatestVersionTag(tags, installedVersion);
       console.log(`[resolve] ${name}: pattern=${guessTagPattern(installedVersion)}, latestFound=${latest}`);
 
       if (latest) {
