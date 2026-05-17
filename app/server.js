@@ -578,6 +578,67 @@ async function getImageInfo(imageId) {
   }
 }
 
+function sanitizeHttpUrl(value) {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+  try {
+    const parsed = new URL(trimmed);
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return null;
+    return parsed.toString();
+  } catch {
+    return null;
+  }
+}
+
+function hasCustomRegistryPrefix(image) {
+  const noDigest = image.split("@")[0];
+  const firstSlash = noDigest.indexOf("/");
+  if (firstSlash === -1) return false;
+
+  const firstSegment = noDigest.slice(0, firstSlash);
+  if (firstSegment === "docker.io" || firstSegment === "index.docker.io") {
+    return false;
+  }
+
+  return (
+    firstSegment.includes(".") ||
+    firstSegment.includes(":") ||
+    firstSegment === "localhost"
+  );
+}
+
+function guessGitHubSourceFromImage(image) {
+  if (image.startsWith("ghcr.io/")) {
+    const { repo, name } = parseGhcrImage(image);
+    if (!repo || !name) return null;
+    return `https://github.com/${repo}/${name}`;
+  }
+
+  if (hasCustomRegistryPrefix(image)) return null;
+
+  const { repo, name } = parseDockerHubImage(image);
+  if (!repo || repo === "library" || !name) return null;
+  return `https://github.com/${repo}/${name}`;
+}
+
+function extractSourceUrlFromImageInfo(imageInfo, image) {
+  const labels = imageInfo?.Config?.Labels ?? {};
+  const candidates = [
+    labels["org.opencontainers.image.source"],
+    labels["org.label-schema.vcs-url"],
+    labels["org.opencontainers.image.url"],
+    labels["org.label-schema.url"],
+  ];
+
+  for (const candidate of candidates) {
+    const safe = sanitizeHttpUrl(candidate);
+    if (safe) return safe;
+  }
+
+  return guessGitHubSourceFromImage(image);
+}
+
 function extractVersionFromLabels(imageInfo, skipOciVersion = false) {
   const labels = imageInfo?.Config?.Labels ?? {};
   const version = skipOciVersion
@@ -723,6 +784,7 @@ async function resolveContainer(c) {
   console.log(`[resolve] ${name}: image=${image}, tagVersion=${tagVersion}, isVersionTag=${isVersionTag(tagVersion)}`);
 
   const imageInfo = await getImageInfo(c.ImageID);
+  const sourceUrl = extractSourceUrlFromImageInfo(imageInfo, image);
 
   // Updates work via the Docker engine API (pull + recreate) so we can
   // refresh anything that's referenced by tag — no compose dir / file
@@ -805,6 +867,7 @@ async function resolveContainer(c) {
     name,
     status: c.State,
     image,
+    ...(sourceUrl && { sourceUrl }),
     currentVersion: installedVersion,
     latestVersion,
     updateAvailable,
@@ -1064,13 +1127,22 @@ app.get("/dashboard", (req, res) => {
 <html>
 <head>
   <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
-    body { font-family: sans-serif; font-size: 13px; background: transparent; color: #e0e0e0; padding: 12px; }
+    body { font-family: sans-serif; font-size: 13px; background: transparent; color: #e0e0e0; padding: 2px; }
     table { width: 100%; border-collapse: collapse; }
     th { text-align: left; padding: 6px 8px; color: #888; font-weight: normal; border-bottom: 1px solid #333; }
     td { padding: 6px 8px; border-bottom: 1px solid #222; vertical-align: middle; }
     tr:hover td { background: #ffffff08; }
+    .container-link {
+      color: inherit;
+      text-decoration: underline;
+      text-decoration-thickness: 1px;
+      text-decoration-color: #4b648f;
+      text-underline-offset: 2px;
+    }
+    .container-link:hover { color: #ffffff; text-decoration-color: #86a6de; }
     .server { color: #7a8fff; font-size: 11px; margin-top: 2px; }
     .ok { color: #4caf50; }
     .update-badge { color: #ff9800; font-weight: bold; }
@@ -1106,6 +1178,84 @@ app.get("/dashboard", (req, res) => {
       text-overflow: ellipsis;
       width: 200px;
       display: inline-block;
+    }
+
+    @media (max-width: 700px) {
+      body {
+        padding: 2px;
+        font-size: 12px;
+      }
+
+      thead {
+        display: none;
+      }
+
+      table,
+      tbody,
+      tr,
+      td {
+        display: block;
+        width: 100%;
+      }
+
+      tr {
+        border: 1px solid #2a3342;
+        border-radius: 8px;
+        margin-bottom: 10px;
+        overflow: hidden;
+        background: #ffffff05;
+      }
+
+      tr:hover td {
+        background: transparent;
+      }
+
+      td {
+        border-bottom: 1px solid #1f2734;
+        padding: 8px 10px;
+        display: flex;
+        align-items: flex-start;
+        justify-content: space-between;
+        gap: 12px;
+      }
+
+      td:last-child {
+        border-bottom: none;
+      }
+
+      td[data-label]::before {
+        content: attr(data-label);
+        color: #8da0bf;
+        font-size: 10px;
+        font-weight: bold;
+        letter-spacing: 0.04em;
+        text-transform: uppercase;
+        flex: 0 0 78px;
+        margin-top: 3px;
+      }
+
+      td[data-label="Container"] {
+        display: block;
+      }
+
+      td[data-label="Container"]::before {
+        display: block;
+        margin: 0 0 4px 0;
+      }
+
+      .version {
+        width: auto;
+        max-width: 100%;
+        white-space: normal;
+        overflow: visible;
+        text-overflow: clip;
+        text-align: right;
+        overflow-wrap: anywhere;
+      }
+
+      .btn-update {
+        padding: 4px 10px;
+      }
     }
   </style>
 </head>
@@ -1143,14 +1293,18 @@ app.get("/dashboard", (req, res) => {
           : \`<span class="update-badge">↑ Yes</span>\`
         : \`<span class="ok">✓</span>\`;
 
+      const containerLabel = c.sourceUrl
+        ? \`<a class="container-link" href="\${c.sourceUrl}">\${c.name}</a>\`
+        : \`\${c.name}\`;
+
       tr.innerHTML = \`
-        <td>
-          <div>\${c.name}</div>
+        <td data-label="Container">
+          <div>\${containerLabel}</div>
           <div class="server">\${c.server}</div>
         </td>
-        <td><div class='version'>\${c.currentVersion}</div></td>
-        <td><div class='version'>\${c.latestVersion}</div></td>
-        <td>\${updateCell}</td>
+        <td data-label="Current"><div class='version'>\${c.currentVersion}</div></td>
+        <td data-label="Latest"><div class='version'>\${c.latestVersion}</div></td>
+        <td data-label="Update">\${updateCell}</td>
       \`;
       return tr;
     }
