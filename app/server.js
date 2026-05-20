@@ -55,6 +55,51 @@ console.log(`  EXCLUDE_IMAGES: ${EXCLUDE_IMAGES.join(", ") || "None"}`);
 console.log(`  EXCLUDE_NAMES: ${EXCLUDE_NAMES.join(", ") || "None"}`);
 console.log(`  GHCR_TOKENS: ${Object.keys(GHCR_TOKENS).join(", ") || "None"}`);
 
+const ENABLE_TIMING_LOGS = process.env.ENABLE_TIMING_LOGS !== "0";
+
+function parsePositiveInt(value, fallback) {
+  const parsed = Number.parseInt(value, 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+function parseNonNegativeInt(value, fallback) {
+  const parsed = Number.parseInt(value, 10);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
+}
+
+const REGISTRY_HTTP_TIMEOUT_MS = parsePositiveInt(
+  process.env.REGISTRY_HTTP_TIMEOUT_MS,
+  4000
+);
+const GHCR_LATEST_CHAIN_TIMEOUT_MS = parsePositiveInt(
+  process.env.GHCR_LATEST_CHAIN_TIMEOUT_MS,
+  6000
+);
+const GHCR_LATEST_CREATED_TTL_MS = parseNonNegativeInt(
+  process.env.GHCR_LATEST_CREATED_TTL_MS,
+  5 * 60 * 1000
+);
+
+const HTTPS_KEEP_ALIVE_AGENT = new https.Agent({
+  keepAlive: true,
+  maxSockets: 32,
+});
+
+function elapsedMs(startNs) {
+  return Number(process.hrtime.bigint() - startNs) / 1e6;
+}
+
+function logTiming(scope, step, ms, details = "") {
+  if (!ENABLE_TIMING_LOGS) return;
+  const suffix = details ? ` ${details}` : "";
+  console.log(`[timing] ${scope} ${step}: ${ms.toFixed(1)}ms${suffix}`);
+}
+
+console.log(`  ENABLE_TIMING_LOGS: ${ENABLE_TIMING_LOGS}`);
+console.log(`  REGISTRY_HTTP_TIMEOUT_MS: ${REGISTRY_HTTP_TIMEOUT_MS}`);
+console.log(`  GHCR_LATEST_CHAIN_TIMEOUT_MS: ${GHCR_LATEST_CHAIN_TIMEOUT_MS}`);
+console.log(`  GHCR_LATEST_CREATED_TTL_MS: ${GHCR_LATEST_CREATED_TTL_MS}`);
+
 function getGhcrToken(image) {
   // Match longest prefix first, e.g. "ghcr.io/hwndmaster" before "ghcr.io"
   const lower = image.toLowerCase();
@@ -78,7 +123,11 @@ function isExcluded(image, containerName) {
 /* ------------------------------------------------------------------ */
 
 const tagCache = new Map();
+const registryTagsInFlight = new Map();
 const CACHE_TTL_MS = 10 * 60 * 1000;
+
+const ghcrLatestCreatedCache = new Map();
+const ghcrLatestCreatedInFlight = new Map();
 
 function getCachedTags(image) {
   const entry = tagCache.get(image);
@@ -92,6 +141,26 @@ function setCachedTags(image, result) {
 
 function clearCachedTags(image) {
   tagCache.delete(image);
+}
+
+function getGhcrLatestCacheKey(image) {
+  return image.split("@")[0].toLowerCase();
+}
+
+function getCachedGhcrLatestCreated(cacheKey, allowExpired = false) {
+  const entry = ghcrLatestCreatedCache.get(cacheKey);
+  if (!entry) return undefined;
+  if (Date.now() < entry.expiresAt) return entry.result;
+  if (allowExpired) return entry.result;
+  return undefined;
+}
+
+function setCachedGhcrLatestCreated(cacheKey, result) {
+  if (GHCR_LATEST_CREATED_TTL_MS <= 0) return;
+  ghcrLatestCreatedCache.set(cacheKey, {
+    result,
+    expiresAt: Date.now() + GHCR_LATEST_CREATED_TTL_MS,
+  });
 }
 
 /* ------------------------------------------------------------------ */
@@ -286,15 +355,17 @@ function dockerPullImage(image, registryAuth) {
 /*  Generic HTTPS GET helper                                          */
 /* ------------------------------------------------------------------ */
 
-function httpsGet(url, headers = {}) {
+function httpsGet(url, headers = {}, timeoutMs = REGISTRY_HTTP_TIMEOUT_MS) {
   return new Promise((resolve, reject) => {
     const options = new URL(url);
     options.headers = { "User-Agent": "docker-status-api/1.0", ...headers };
+    options.agent = HTTPS_KEEP_ALIVE_AGENT;
 
-    https
-      .get(options, (res) => {
+    const req = https.get(options, (res) => {
         if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
-          return httpsGet(res.headers.location, headers).then(resolve).catch(reject);
+          return httpsGet(res.headers.location, headers, timeoutMs)
+            .then(resolve)
+            .catch(reject);
         }
         if (res.statusCode === 401) {
           reject(new Error(`HTTP 401 - auth required (${url})`));
@@ -310,8 +381,12 @@ function httpsGet(url, headers = {}) {
             reject(new Error(`JSON parse error for ${url}: ${e.message}`));
           }
         });
-      })
-      .on("error", reject);
+      });
+
+    req.setTimeout(timeoutMs, () => {
+      req.destroy(new Error(`HTTPS timeout after ${timeoutMs}ms (${url})`));
+    });
+    req.on("error", reject);
   });
 }
 
@@ -373,28 +448,46 @@ async function fetchDockerHubTags(repo, name) {
 /* ------------------------------------------------------------------ */
 
 // Get an anonymous pull token for public GHCR repos.
-async function fetchGhcrAnonToken(repo, name) {
+async function fetchGhcrAnonToken(repo, name, timeoutMs = REGISTRY_HTTP_TIMEOUT_MS) {
   const url = `https://ghcr.io/token?scope=repository:${repo}/${name}:pull&service=ghcr.io`;
-  const { body } = await httpsGet(url);
+  const { body } = await httpsGet(url, {}, timeoutMs);
   return body.token || body.access_token || null;
 }
 
 // Get a Bearer token using a PAT (for private repos or manifest access).
 // GHCR accepts PATs as password in Basic auth to exchange for a Bearer token.
-async function fetchGhcrBearerToken(repo, name, pat) {
+async function fetchGhcrBearerToken(
+  repo,
+  name,
+  pat,
+  timeoutMs = REGISTRY_HTTP_TIMEOUT_MS
+) {
   const url = `https://ghcr.io/token?scope=repository:${repo}/${name}:pull&service=ghcr.io`;
   const basic = Buffer.from(`x-access-token:${pat}`).toString("base64");
-  const { body } = await httpsGet(url, { Authorization: `Basic ${basic}` });
+  const { body } = await httpsGet(
+    url,
+    { Authorization: `Basic ${basic}` },
+    timeoutMs
+  );
   return body.token || body.access_token || null;
 }
 
-async function fetchGhcrTags(repo, name, pat = null) {
+async function fetchGhcrTags(
+  repo,
+  name,
+  pat = null,
+  timeoutMs = REGISTRY_HTTP_TIMEOUT_MS
+) {
   const token = pat
-    ? await fetchGhcrBearerToken(repo, name, pat)
-    : await fetchGhcrAnonToken(repo, name);
+    ? await fetchGhcrBearerToken(repo, name, pat, timeoutMs)
+    : await fetchGhcrAnonToken(repo, name, timeoutMs);
   if (!token) throw new Error(`Could not get GHCR token for ${repo}/${name}`);
   const url = `https://ghcr.io/v2/${repo}/${name}/tags/list`;
-  const { body } = await httpsGet(url, { Authorization: `Bearer ${token}` });
+  const { body } = await httpsGet(
+    url,
+    { Authorization: `Bearer ${token}` },
+    timeoutMs
+  );
   // GHCR's tags/list only returns names. Fetching the manifest digest
   // for each tag would require N extra round-trips, so we leave digest
   // null and skip digest-based refinement for GHCR images. They tend to
@@ -410,8 +503,24 @@ async function fetchGhcrTags(repo, name, pat = null) {
 // Resolution order:
 //   1. OCI annotation on the manifest (cheap; depends on build pipeline)
 //   2. `created` field inside the image's config blob (always set by buildkit)
-async function fetchGhcrLatestCreated(repo, name, pat) {
-  const token = await fetchGhcrBearerToken(repo, name, pat);
+async function fetchGhcrLatestCreated(
+  repo,
+  name,
+  pat,
+  timeoutMs = GHCR_LATEST_CHAIN_TIMEOUT_MS
+) {
+  const startedAt = Date.now();
+  const remainingMs = () => {
+    const left = timeoutMs - (Date.now() - startedAt);
+    if (left <= 0) {
+      throw new Error(
+        `GHCR latest check timed out for ${repo}/${name} after ${timeoutMs}ms`
+      );
+    }
+    return left;
+  };
+
+  const token = await fetchGhcrBearerToken(repo, name, pat, remainingMs());
   if (!token) throw new Error(`Could not get GHCR token for ${repo}/${name}`);
 
   // Accept both single image manifests AND image indexes (multi-arch lists),
@@ -427,7 +536,7 @@ async function fetchGhcrLatestCreated(repo, name, pat) {
   const { body: top } = await httpsGet(manifestUrl, {
     Authorization: `Bearer ${token}`,
     Accept: acceptManifest,
-  });
+  }, remainingMs());
 
   // If we got back a manifest list / image index, follow it to one
   // platform-specific manifest before reading any annotations or the config.
@@ -447,7 +556,8 @@ async function fetchGhcrLatestCreated(repo, name, pat) {
 
     const { body: inner } = await httpsGet(
       `https://ghcr.io/v2/${repo}/${name}/manifests/${pick.digest}`,
-      { Authorization: `Bearer ${token}`, Accept: acceptManifest }
+      { Authorization: `Bearer ${token}`, Accept: acceptManifest },
+      remainingMs()
     );
     manifest = inner;
   }
@@ -463,7 +573,8 @@ async function fetchGhcrLatestCreated(repo, name, pat) {
 
   const { body: config } = await httpsGet(
     `https://ghcr.io/v2/${repo}/${name}/blobs/${configDigest}`,
-    { Authorization: `Bearer ${token}`, Accept: "application/vnd.oci.image.config.v1+json,application/vnd.docker.container.image.v1+json,application/json" }
+    { Authorization: `Bearer ${token}`, Accept: "application/vnd.oci.image.config.v1+json,application/vnd.docker.container.image.v1+json,application/json" },
+    remainingMs()
   );
 
   const created =
@@ -472,6 +583,46 @@ async function fetchGhcrLatestCreated(repo, name, pat) {
     null;
 
   return created ? created.slice(0, 19) : null;
+}
+
+async function getGhcrLatestCreatedCached(image, repo, name, pat) {
+  const cacheKey = getGhcrLatestCacheKey(image);
+
+  const cached = getCachedGhcrLatestCreated(cacheKey);
+  if (cached !== undefined) {
+    return { value: cached, source: "cache" };
+  }
+
+  if (ghcrLatestCreatedInFlight.has(cacheKey)) {
+    return ghcrLatestCreatedInFlight.get(cacheKey);
+  }
+
+  const pending = (async () => {
+    try {
+      const value = await fetchGhcrLatestCreated(
+        repo,
+        name,
+        pat,
+        GHCR_LATEST_CHAIN_TIMEOUT_MS
+      );
+      setCachedGhcrLatestCreated(cacheKey, value);
+      return { value, source: "remote" };
+    } catch (err) {
+      const stale = getCachedGhcrLatestCreated(cacheKey, true);
+      if (stale !== undefined) {
+        console.warn(
+          `[ghcr-cache] ${repo}/${name}: ${err.message}. Using stale cached value.`
+        );
+        return { value: stale, source: "stale-cache" };
+      }
+      throw err;
+    } finally {
+      ghcrLatestCreatedInFlight.delete(cacheKey);
+    }
+  })();
+
+  ghcrLatestCreatedInFlight.set(cacheKey, pending);
+  return pending;
 }
 
 /* ------------------------------------------------------------------ */
@@ -701,18 +852,31 @@ async function getRegistryTags(image) {
   const cached = getCachedTags(image);
   if (cached !== undefined) return cached;
 
-  const registry = detectRegistry(image);
-  let tags = [];
-  if (registry === "ghcr") {
-    const { repo, name } = parseGhcrImage(image);
-    const pat = getGhcrToken(image);
-    tags = await fetchGhcrTags(repo, name, pat);
-  } else {
-    const { repo, name } = parseDockerHubImage(image);
-    tags = await fetchDockerHubTags(repo, name);
+  if (registryTagsInFlight.has(image)) {
+    return registryTagsInFlight.get(image);
   }
-  setCachedTags(image, tags);
-  return tags;
+
+  const pending = (async () => {
+    const registry = detectRegistry(image);
+    let tags = [];
+    if (registry === "ghcr") {
+      const { repo, name } = parseGhcrImage(image);
+      const pat = getGhcrToken(image);
+      tags = await fetchGhcrTags(repo, name, pat);
+    } else {
+      const { repo, name } = parseDockerHubImage(image);
+      tags = await fetchDockerHubTags(repo, name);
+    }
+    setCachedTags(image, tags);
+    return tags;
+  })();
+
+  registryTagsInFlight.set(image, pending);
+  try {
+    return await pending;
+  } finally {
+    registryTagsInFlight.delete(image);
+  }
 }
 
 // Pure: pick the highest-versioned tag that matches the same versioning
@@ -775,16 +939,31 @@ function findCurrentVersionByDigest(tags, localDigest) {
 /*  Core: resolve one raw Docker container object → our format        */
 /* ------------------------------------------------------------------ */
 
-async function resolveContainer(c) {
+async function resolveContainer(c, onTiming = null) {
   const name = c.Names[0].replace(/^\//, "");
   const image = c.Image;
   const tagVersion = extractTag(image);
   const pat = getGhcrToken(image);
+  const containerStart = process.hrtime.bigint();
+
+  const recordTiming = (stage, ms, details = "") => {
+    if (typeof onTiming === "function") {
+      onTiming({ name, image, stage, ms, details });
+    }
+    const detailPrefix = `image=${image}`;
+    const detailText = details ? `${detailPrefix} ${details}` : detailPrefix;
+    logTiming(`[resolve:${name}]`, stage, ms, detailText);
+  };
 
   console.log(`[resolve] ${name}: image=${image}, tagVersion=${tagVersion}, isVersionTag=${isVersionTag(tagVersion)}`);
 
+  const inspectStart = process.hrtime.bigint();
   const imageInfo = await getImageInfo(c.ImageID);
+  recordTiming("inspect-image", elapsedMs(inspectStart));
+
+  const sourceStart = process.hrtime.bigint();
   const sourceUrl = extractSourceUrlFromImageInfo(imageInfo, image);
+  recordTiming("extract-source-url", elapsedMs(sourceStart));
 
   // Updates work via the Docker engine API (pull + recreate) so we can
   // refresh anything that's referenced by tag — no compose dir / file
@@ -794,6 +973,7 @@ async function resolveContainer(c) {
 
   let installedVersion = tagVersion;
   let installedFromCreated = false;
+  const installedVersionStart = process.hrtime.bigint();
 
   if (!isVersionTag(tagVersion)) {
     console.log(`[resolve] ${name}: created=${imageInfo?.Created}, labels=${JSON.stringify(imageInfo?.Config?.Labels)}`);
@@ -817,6 +997,11 @@ async function resolveContainer(c) {
       }
     }
   }
+  recordTiming(
+    "resolve-installed-version",
+    elapsedMs(installedVersionStart),
+    `installed=${installedVersion} fromCreated=${installedFromCreated}`
+  );
 
   let latestVersion = installedVersion;
   let updateAvailable = false;
@@ -824,9 +1009,20 @@ async function resolveContainer(c) {
 
   try {
     if (installedFromCreated && image.startsWith("ghcr.io/") && pat) {
+      const remoteCreatedStart = process.hrtime.bigint();
       // Timestamp-based GHCR image with PAT — compare manifest creation timestamp
       const { repo, name: imgName } = parseGhcrImage(image);
-      const remoteCreated = await fetchGhcrLatestCreated(repo, imgName, pat);
+      const { value: remoteCreated, source } = await getGhcrLatestCreatedCached(
+        image,
+        repo,
+        imgName,
+        pat
+      );
+      recordTiming(
+        "fetch-ghcr-latest-created",
+        elapsedMs(remoteCreatedStart),
+        `source=${source}`
+      );
       console.log(`[resolve] ${name}: remoteCreated=${remoteCreated}, installedCreated=${installedVersion}`);
       if (remoteCreated) {
         latestVersion = remoteCreated;
@@ -834,11 +1030,14 @@ async function resolveContainer(c) {
         updateAvailable = remoteCreated > installedVersion;
       }
     } else if (!installedFromCreated && !hasDigest(image)) {
+      const registryTagsStart = process.hrtime.bigint();
       // Tag-based comparison. Fetch tags once and use the same list for
       // both the installed-version refinement and the latest-version
       // lookup — they share a cache so this is one network call.
       const tags = await getRegistryTags(image);
+      recordTiming("fetch-registry-tags", elapsedMs(registryTagsStart));
 
+      const compareStart = process.hrtime.bigint();
       // Refine `installedVersion` if the registry tells us a more specific
       // tag points to our local image. Catches cases like Dashy where the
       // OCI label is "4.0" but the tag pointing to that exact digest is
@@ -857,11 +1056,19 @@ async function resolveContainer(c) {
         latestVersion = latest;
         updateAvailable = normalizeTag(latest) !== normalizeTag(installedVersion);
       }
+      recordTiming("compare-versions", elapsedMs(compareStart));
     }
   } catch (e) {
     console.error(`[version-check] ${image}: ${e.message}`);
     error = e.message;
   }
+
+  const totalMs = elapsedMs(containerStart);
+  recordTiming(
+    "total",
+    totalMs,
+    `updateAvailable=${updateAvailable}${error ? " hasError=true" : ""}`
+  );
 
   return {
     name,
@@ -922,16 +1129,85 @@ function fetchRemoteContainers(server) {
 /* ------------------------------------------------------------------ */
 
 app.get("/containers", async (req, res) => {
+  const requestId = Math.random().toString(36).slice(2, 8);
+  const requestStart = process.hrtime.bigint();
+  const perContainerTiming = new Map();
+
+  const onContainerTiming = ({ name, stage, ms }) => {
+    const current = perContainerTiming.get(name) || { totalMs: 0, stages: [] };
+    if (stage === "total") {
+      current.totalMs = ms;
+    } else {
+      current.stages.push({ stage, ms });
+    }
+    perContainerTiming.set(name, current);
+  };
+
   try {
+    const listStart = process.hrtime.bigint();
     const raw = await dockerRequest("/containers/json");
+    logTiming(
+      `[/containers:${requestId}]`,
+      "docker-list",
+      elapsedMs(listStart),
+      `count=${raw.length}`
+    );
+
+    const filterStart = process.hrtime.bigint();
     const filtered = raw.filter((c) => {
       const name = c.Names[0].replace(/^\//, "");
       return !isExcluded(c.Image, name);
     });
-    const containers = await Promise.all(filtered.map(resolveContainer));
+    logTiming(
+      `[/containers:${requestId}]`,
+      "filter",
+      elapsedMs(filterStart),
+      `count=${filtered.length}`
+    );
+
+    const resolveStart = process.hrtime.bigint();
+    const containers = await Promise.all(
+      filtered.map((c) => resolveContainer(c, onContainerTiming))
+    );
+    logTiming(
+      `[/containers:${requestId}]`,
+      "resolve-all",
+      elapsedMs(resolveStart),
+      `count=${containers.length}`
+    );
+
+    const slowestContainers = [...perContainerTiming.entries()]
+      .map(([name, data]) => ({
+        name,
+        totalMs: data.totalMs || data.stages.reduce((sum, stage) => sum + stage.ms, 0),
+        topStages: [...data.stages].sort((a, b) => b.ms - a.ms).slice(0, 3),
+      }))
+      .sort((a, b) => b.totalMs - a.totalMs)
+      .slice(0, 5);
+
+    for (const item of slowestContainers) {
+      const topStagesText = item.topStages
+        .map((stage) => `${stage.stage}=${stage.ms.toFixed(1)}ms`)
+        .join(", ");
+      logTiming(
+        `[/containers:${requestId}]`,
+        `slow-container ${item.name}`,
+        item.totalMs,
+        topStagesText ? `top=${topStagesText}` : ""
+      );
+    }
+
+    logTiming(
+      `[/containers:${requestId}]`,
+      "request-total",
+      elapsedMs(requestStart),
+      `returned=${containers.length}`
+    );
+
     res.json({ containers });
   } catch (err) {
-    console.error("[/containers]", err);
+    logTiming(`[/containers:${requestId}]`, "request-total", elapsedMs(requestStart), "status=500");
+    console.error(`[/containers:${requestId}]`, err);
     res.status(500).json({ error: err.message });
   }
 });
