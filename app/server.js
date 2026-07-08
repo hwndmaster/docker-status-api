@@ -129,6 +129,38 @@ const CACHE_TTL_MS = 10 * 60 * 1000;
 const ghcrLatestCreatedCache = new Map();
 const ghcrLatestCreatedInFlight = new Map();
 
+// Latest-version lookups for GHCR images (GitHub releases API / manifest
+// annotations), keyed by source-repo slug or image ref.
+const latestVersionCache = new Map();
+const latestVersionInFlight = new Map();
+
+// Generic TTL + in-flight-dedup + stale-on-error lookup used by the
+// latest-version caches above.
+async function cachedLookup(cache, inFlight, key, ttlMs, fetcher) {
+  const entry = cache.get(key);
+  if (entry && Date.now() < entry.expiresAt) return entry.result;
+  if (inFlight.has(key)) return inFlight.get(key);
+
+  const pending = (async () => {
+    try {
+      const result = await fetcher();
+      cache.set(key, { result, expiresAt: Date.now() + ttlMs });
+      return result;
+    } catch (err) {
+      if (entry) {
+        console.warn(`[cache] ${key}: ${err.message}. Using stale cached value.`);
+        return entry.result;
+      }
+      throw err;
+    } finally {
+      inFlight.delete(key);
+    }
+  })();
+
+  inFlight.set(key, pending);
+  return pending;
+}
+
 function getCachedTags(image) {
   const entry = tagCache.get(image);
   if (entry && Date.now() < entry.expiresAt) return entry.result;
@@ -376,7 +408,7 @@ function httpsGet(url, headers = {}, timeoutMs = REGISTRY_HTTP_TIMEOUT_MS) {
         res.on("data", (chunk) => (data += chunk));
         res.on("end", () => {
           try {
-            resolve({ status: res.statusCode, body: JSON.parse(data) });
+            resolve({ status: res.statusCode, body: JSON.parse(data), headers: res.headers });
           } catch (e) {
             reject(new Error(`JSON parse error for ${url}: ${e.message}`));
           }
@@ -472,27 +504,112 @@ async function fetchGhcrBearerToken(
   return body.token || body.access_token || null;
 }
 
-async function fetchGhcrTags(
-  repo,
-  name,
-  pat = null,
-  timeoutMs = REGISTRY_HTTP_TIMEOUT_MS
-) {
-  const token = pat
-    ? await fetchGhcrBearerToken(repo, name, pat, timeoutMs)
-    : await fetchGhcrAnonToken(repo, name, timeoutMs);
-  if (!token) throw new Error(`Could not get GHCR token for ${repo}/${name}`);
-  const url = `https://ghcr.io/v2/${repo}/${name}/tags/list`;
-  const { body } = await httpsGet(
-    url,
-    { Authorization: `Bearer ${token}` },
-    timeoutMs
+// GHCR's tags/list is unusable for "what's the newest version": it
+// paginates in insertion order (oldest first) and repos that tag every
+// commit (immich: 100k+ tags) would need a ~150-request walk to reach the
+// newest tags. Instead, the latest version for a GHCR image comes from:
+//   1. The GitHub releases API of the image's source repo (from the
+//      org.opencontainers.image.source label) — one request, and immich's
+//      two containers share the same repo so they share one lookup.
+//   2. Fallback: the org.opencontainers.image.version annotation on the
+//      remote manifest of the tag we'd pull. This is the newest build OF
+//      THAT TAG (e.g. "v2" → "v2.7.5"), so it misses newer major series,
+//      but it needs no GitHub release to exist.
+
+// "https://github.com/owner/repo[/...]" → "owner/repo", else null.
+function parseGitHubRepo(sourceUrl) {
+  if (!sourceUrl) return null;
+  try {
+    const u = new URL(sourceUrl);
+    if (u.hostname !== "github.com" && u.hostname !== "www.github.com") return null;
+    const [owner, repo] = u.pathname.replace(/^\//, "").split("/");
+    if (!owner || !repo) return null;
+    return `${owner}/${repo.replace(/\.git$/, "")}`;
+  } catch {
+    return null;
+  }
+}
+
+// Latest (non-prerelease, non-draft) release tag of a GitHub repo, or null
+// when the repo has no releases. Anonymous rate limit is 60/hr — fine with
+// the 10-minute per-repo cache, and cachedLookup falls back to the stale
+// value if we do get throttled.
+async function fetchGitHubLatestReleaseTag(repoSlug) {
+  const { status, body } = await httpsGet(
+    `https://api.github.com/repos/${repoSlug}/releases/latest`,
+    { Accept: "application/vnd.github+json" }
   );
-  // GHCR's tags/list only returns names. Fetching the manifest digest
-  // for each tag would require N extra round-trips, so we leave digest
-  // null and skip digest-based refinement for GHCR images. They tend to
-  // use precise version tags (or the timestamp fallback) anyway.
-  return (body.tags || []).map((n) => ({ name: n, digest: null }));
+  if (status === 404) return null; // repo has no releases
+  if (status !== 200) {
+    throw new Error(`GitHub releases API for ${repoSlug} returned HTTP ${status}`);
+  }
+  const tag = body?.tag_name;
+  if (!tag || guessTagPattern(tag) === "unknown") return null;
+  return tag;
+}
+
+// Version annotation + manifest digest of one specific remote GHCR tag.
+// The digest is the same one RepoDigests records locally after a pull, so
+// comparing them tells whether pulling this tag would download anything.
+async function fetchGhcrManifestInfo(repo, name, tag, pat) {
+  const token = pat
+    ? await fetchGhcrBearerToken(repo, name, pat)
+    : await fetchGhcrAnonToken(repo, name);
+  if (!token) throw new Error(`Could not get GHCR token for ${repo}/${name}`);
+
+  const accept = [
+    "application/vnd.oci.image.manifest.v1+json",
+    "application/vnd.docker.distribution.manifest.v2+json",
+    "application/vnd.oci.image.index.v1+json",
+    "application/vnd.docker.distribution.manifest.list.v2+json",
+  ].join(",");
+
+  const { status, body, headers } = await httpsGet(
+    `https://ghcr.io/v2/${repo}/${name}/manifests/${encodeURIComponent(tag)}`,
+    { Authorization: `Bearer ${token}`, Accept: accept }
+  );
+  if (status !== 200) return null;
+
+  let version = body?.annotations?.["org.opencontainers.image.version"] || null;
+  if (
+    version &&
+    (NON_VERSION_TAGS.has(version.toLowerCase()) ||
+      guessTagPattern(version) === "unknown")
+  ) {
+    version = null;
+  }
+  return { version, digest: headers?.["docker-content-digest"] || null };
+}
+
+async function getGhcrManifestInfoCached(image, pat) {
+  const { repo, name } = parseGhcrImage(image);
+  const tag = extractTag(image);
+  return cachedLookup(
+    latestVersionCache,
+    latestVersionInFlight,
+    `ghcr-manifest:${repo}/${name}:${tag}`,
+    CACHE_TTL_MS,
+    () => fetchGhcrManifestInfo(repo, name, tag, pat)
+  );
+}
+
+// Resolve the latest available version for a GHCR image. Returns a version
+// string or null when nothing trustworthy was found.
+async function getGhcrLatestVersion(image, sourceUrl, pat) {
+  const repoSlug = parseGitHubRepo(sourceUrl);
+  if (repoSlug) {
+    const releaseTag = await cachedLookup(
+      latestVersionCache,
+      latestVersionInFlight,
+      `github-release:${repoSlug}`,
+      CACHE_TTL_MS,
+      () => fetchGitHubLatestReleaseTag(repoSlug)
+    );
+    if (releaseTag) return releaseTag;
+  }
+
+  const info = await getGhcrManifestInfoCached(image, pat);
+  return info?.version || null;
 }
 
 // Fetch the creation timestamp of the latest manifest from GHCR.
@@ -800,6 +917,11 @@ function extractVersionFromLabels(imageInfo, skipOciVersion = false) {
       null;
   // Ignore label if author wrote "latest" or similar as version
   if (version && NON_VERSION_TAGS.has(version.toLowerCase())) return null;
+  // Some images ship garbage in the version label (e.g. lissy93/
+  // networking-toolbox publishes "ghcr.io-lissy93-networking-toolbox-latest").
+  // Only trust values that actually look like a version — semver-ish or
+  // date-based, i.e. starting with digits after an optional "v".
+  if (version && guessTagPattern(version) === "unknown") return null;
   return version;
 }
 
@@ -842,10 +964,12 @@ function extractComposeDir(containerLabels, imageInfo) {
 /*  Tag resolution                                                    */
 /* ------------------------------------------------------------------ */
 
-// Fetch (and cache) the registry's tag list for an image as
-// [{ name, digest }]. Caching is per image because different tag lookups
-// for the same image (latest-detection, current-version refinement) can
-// share the same fetched list.
+// Fetch (and cache) the registry's tag list for a Docker Hub image as
+// [{ name, digest }]. GHCR images don't use this — their latest version
+// comes from getGhcrLatestVersion (see the comment there for why).
+// Caching is per image because different tag lookups for the same image
+// (latest-detection, current-version refinement) can share the same
+// fetched list.
 async function getRegistryTags(image) {
   if (hasDigest(image)) return [];
 
@@ -857,16 +981,8 @@ async function getRegistryTags(image) {
   }
 
   const pending = (async () => {
-    const registry = detectRegistry(image);
-    let tags = [];
-    if (registry === "ghcr") {
-      const { repo, name } = parseGhcrImage(image);
-      const pat = getGhcrToken(image);
-      tags = await fetchGhcrTags(repo, name, pat);
-    } else {
-      const { repo, name } = parseDockerHubImage(image);
-      tags = await fetchDockerHubTags(repo, name);
-    }
+    const { repo, name } = parseDockerHubImage(image);
+    const tags = await fetchDockerHubTags(repo, name);
     setCachedTags(image, tags);
     return tags;
   })();
@@ -887,7 +1003,9 @@ function findLatestVersionTag(tags, installedVersion) {
     .filter((t) => isVersionTag(t.name))
     .filter((t) => pattern === "unknown" || guessTagPattern(t.name) === pattern)
     .map((t) => t.name)
-    .sort(compareVersions);
+    // Tie-break equal versions by shorter name so the plain tag wins over
+    // suffixed variants ("v3.0.1" over "v3.0.1-cuda" / "v3.0.1-rocm").
+    .sort((a, b) => compareVersions(a, b) || a.length - b.length);
   return candidates.length > 0 ? candidates[0] : null;
 }
 
@@ -996,6 +1114,20 @@ async function resolveContainer(c, onTiming = null) {
         console.log(`[resolve] ${name}: installedVersion=${installedVersion} (from creation timestamp)`);
       }
     }
+  } else {
+    // The tag is version-shaped but may be a coarse rolling tag — immich
+    // publishes "v2" that tracks the whole major series. When the image's
+    // version label refines the tag (label "v2.7.5" for tag "v2", i.e.
+    // same version prefix with more components), prefer the label.
+    const skipOci = image.startsWith("ghcr.io/") && pat !== null;
+    const labelVersion = extractVersionFromLabels(imageInfo, skipOci);
+    if (
+      labelVersion &&
+      normalizeTag(labelVersion).startsWith(normalizeTag(tagVersion) + ".")
+    ) {
+      installedVersion = labelVersion;
+      console.log(`[resolve] ${name}: refined tag ${tagVersion} → ${installedVersion} via version label`);
+    }
   }
   recordTiming(
     "resolve-installed-version",
@@ -1005,6 +1137,12 @@ async function resolveContainer(c, onTiming = null) {
 
   let latestVersion = installedVersion;
   let updateAvailable = false;
+  // Whether pulling the container's OWN tag would fetch a newer image —
+  // that's what the /update endpoint actually does. Distinct from
+  // updateAvailable: a container pinned to "v2" can't reach v3.0.1 by
+  // pulling; that needs a tag change in the compose file. null = unknown
+  // (falls back to updateAvailable in the response).
+  let pullUpdateAvailable = null;
   let error = null;
 
   try {
@@ -1029,11 +1167,58 @@ async function resolveContainer(c, onTiming = null) {
         // ISO 8601 strings sort lexicographically, so > works as expected.
         updateAvailable = remoteCreated > installedVersion;
       }
-    } else if (!installedFromCreated && !hasDigest(image)) {
+    } else if (!hasDigest(image) && detectRegistry(image) === "ghcr") {
+      // GHCR: tag listing is impractical (see getGhcrLatestVersion), so
+      // the latest version comes from the source repo's GitHub releases,
+      // falling back to the remote manifest's version annotation.
+      if (!installedFromCreated) {
+        const ghcrLatestStart = process.hrtime.bigint();
+        const latest = await getGhcrLatestVersion(image, sourceUrl, pat);
+        recordTiming("fetch-ghcr-latest-version", elapsedMs(ghcrLatestStart));
+        console.log(`[resolve] ${name}: ghcrLatest=${latest}, installed=${installedVersion}`);
+
+        const installedPattern = guessTagPattern(installedVersion);
+        if (
+          latest &&
+          (installedPattern === "unknown" || guessTagPattern(latest) === installedPattern)
+        ) {
+          latestVersion = latest;
+          // Strictly newer only — a source repo's release can briefly lag
+          // the images (or describe a different component), and "different"
+          // must not read as "update available" here.
+          updateAvailable = compareVersions(latest, installedVersion) < 0;
+        }
+      }
+
+      // Same-tag pull check: compare the local image digest against the
+      // remote manifest digest of the tag we'd pull.
+      const digestStart = process.hrtime.bigint();
+      const localDigest = extractRepoDigest(imageInfo, image);
+      const manifestInfo = localDigest
+        ? await getGhcrManifestInfoCached(image, pat).catch((e) => {
+            console.warn(`[resolve] ${name}: manifest digest check failed: ${e.message}`);
+            return null;
+          })
+        : null;
+      if (manifestInfo?.digest && localDigest) {
+        pullUpdateAvailable = manifestInfo.digest !== localDigest;
+        updateAvailable = updateAvailable || pullUpdateAvailable;
+      }
+      recordTiming(
+        "check-ghcr-manifest-digest",
+        elapsedMs(digestStart),
+        `pullUpdate=${pullUpdateAvailable}`
+      );
+    } else if (!hasDigest(image)) {
+      // Docker Hub: tag-based comparison. Also entered for
+      // timestamp-fallback images (":latest" with no usable version
+      // label) — Docker Hub exposes per-tag digests, so we can still
+      // decide update-availability by digest even when the installed
+      // "version" is a creation timestamp.
       const registryTagsStart = process.hrtime.bigint();
-      // Tag-based comparison. Fetch tags once and use the same list for
-      // both the installed-version refinement and the latest-version
-      // lookup — they share a cache so this is one network call.
+      // Fetch tags once and use the same list for both the
+      // installed-version refinement and the latest-version lookup — they
+      // share a cache so this is one network call.
       const tags = await getRegistryTags(image);
       recordTiming("fetch-registry-tags", elapsedMs(registryTagsStart));
 
@@ -1047,14 +1232,54 @@ async function resolveContainer(c, onTiming = null) {
       if (refined && refined !== installedVersion) {
         console.log(`[resolve] ${name}: refined ${installedVersion} → ${refined} via digest match`);
         installedVersion = refined;
+        installedFromCreated = false;
       }
 
-      const latest = findLatestVersionTag(tags, installedVersion);
-      console.log(`[resolve] ${name}: pattern=${guessTagPattern(installedVersion)}, latestFound=${latest}`);
+      if (installedFromCreated) {
+        // Installed version is a creation timestamp — tag names can't be
+        // compared against it, so compare digests of the pulled tag instead.
+        const pulledTag = extractTag(image);
+        const remoteDigest = tags.find((t) => t.name === pulledTag)?.digest || null;
+        console.log(
+          `[resolve] ${name}: digest compare tag=${pulledTag} local=${localDigest?.slice(7, 19) ?? "none"} remote=${remoteDigest?.slice(7, 19) ?? "none"}`
+        );
 
-      if (latest) {
-        latestVersion = latest;
-        updateAvailable = normalizeTag(latest) !== normalizeTag(installedVersion);
+        if (remoteDigest && localDigest && remoteDigest === localDigest) {
+          // The tag still points at exactly what we're running.
+          latestVersion = installedVersion;
+          updateAvailable = false;
+        } else {
+          // Prefer the version tag sharing the remote tag's digest; fall
+          // back to the highest version-shaped tag (some repos rebuild
+          // "latest" without moving the version tags, so digests differ).
+          const mapped = remoteDigest
+            ? findCurrentVersionByDigest(tags, remoteDigest)
+            : null;
+          const latest = mapped || findLatestVersionTag(tags, installedVersion);
+          if (latest) latestVersion = latest;
+          updateAvailable = Boolean(
+            remoteDigest && localDigest && remoteDigest !== localDigest
+          );
+        }
+        // Here the comparison IS the same-tag pull check.
+        pullUpdateAvailable = updateAvailable;
+      } else {
+        const latest = findLatestVersionTag(tags, installedVersion);
+        console.log(`[resolve] ${name}: pattern=${guessTagPattern(installedVersion)}, latestFound=${latest}`);
+
+        if (latest) {
+          latestVersion = latest;
+          updateAvailable = normalizeTag(latest) !== normalizeTag(installedVersion);
+        }
+
+        // Same-tag pull check via the digest Docker Hub exposes per tag
+        // (a container pinned to e.g. "postgres:14" may have no newer
+        // "14" build even though newer majors exist — and vice versa).
+        const remoteDigest = tags.find((t) => t.name === extractTag(image))?.digest || null;
+        if (remoteDigest && localDigest) {
+          pullUpdateAvailable = remoteDigest !== localDigest;
+          updateAvailable = updateAvailable || pullUpdateAvailable;
+        }
       }
       recordTiming("compare-versions", elapsedMs(compareStart));
     }
@@ -1070,14 +1295,22 @@ async function resolveContainer(c, onTiming = null) {
     `updateAvailable=${updateAvailable}${error ? " hasError=true" : ""}`
   );
 
+  // Compose project (stack) this container belongs to, used by the
+  // dashboard to group services of one stack into a single row.
+  const project = c.Labels?.["com.docker.compose.project"] || null;
+
   return {
     name,
     status: c.State,
     image,
+    ...(project && { project }),
     ...(sourceUrl && { sourceUrl }),
     currentVersion: installedVersion,
     latestVersion,
     updateAvailable,
+    // Unknown (null) degrades to updateAvailable so the button still
+    // shows where we couldn't compare digests.
+    pullUpdateAvailable: pullUpdateAvailable ?? updateAvailable,
     canUpdate: updatable,
     ...(error && { versionCheckError: error }),
   };
@@ -1420,6 +1653,8 @@ app.get("/dashboard", (req, res) => {
     }
     .container-link:hover { color: #ffffff; text-decoration-color: #86a6de; }
     .server { color: #7a8fff; font-size: 11px; margin-top: 2px; }
+    .members { color: #8a97ab; font-size: 11px; margin-top: 2px; }
+    .vname { color: #8da0bf; font-size: 11px; }
     .ok { color: #4caf50; }
     .update-badge { color: #ff9800; font-weight: bold; }
     .btn-update {
@@ -1453,7 +1688,7 @@ app.get("/dashboard", (req, res) => {
       overflow: hidden;
       text-overflow: ellipsis;
       width: 200px;
-      display: inline-block;
+      display: block;
     }
 
     @media (max-width: 700px) {
@@ -1519,6 +1754,11 @@ app.get("/dashboard", (req, res) => {
         margin: 0 0 4px 0;
       }
 
+      .versions {
+        flex: 1;
+        min-width: 0;
+      }
+
       .version {
         width: auto;
         max-width: 100%;
@@ -1559,27 +1799,86 @@ app.get("/dashboard", (req, res) => {
       setTimeout(() => t.className = 'toast', 3000);
     }
 
-    function renderRow(c) {
+    // Groups currently rendered; doUpdate() looks them up by index.
+    let groups = [];
+
+    function esc(s) {
+      const d = document.createElement('div');
+      d.textContent = s == null ? '' : String(s);
+      return d.innerHTML;
+    }
+
+    // One row per compose project (per server); containers without a
+    // project label stay individual rows.
+    function groupContainers(containers) {
+      const map = new Map();
+      for (const c of containers) {
+        const key = c.server + '|' + (c.project || 'solo:' + c.name);
+        if (!map.has(key)) {
+          map.set(key, { server: c.server, title: c.project || c.name, containers: [] });
+        }
+        map.get(key).containers.push(c);
+      }
+      for (const g of map.values()) {
+        // A project with a single (non-excluded) container reads better
+        // under its precise container name.
+        if (g.containers.length === 1) g.title = g.containers[0].name;
+      }
+      return [...map.values()];
+    }
+
+    function versionCell(g, field) {
+      const unique = [...new Set(g.containers.map(c => c[field]))];
+      const lines = unique.length === 1
+        ? \`<div class='version'>\${esc(unique[0])}</div>\`
+        : g.containers
+            .map(c => \`<div class='version'><span class='vname'>\${esc(c.name)}:</span> \${esc(c[field])}</div>\`)
+            .join('');
+      return \`<div class='versions'>\${lines}</div>\`;
+    }
+
+    // Pulling only helps when the container's own tag has a newer build;
+    // old remote servers may not send pullUpdateAvailable yet.
+    function canPullUpdate(c) {
+      return (c.pullUpdateAvailable !== undefined ? c.pullUpdateAvailable : c.updateAvailable) && c.canUpdate;
+    }
+
+    function renderGroup(g, idx) {
       const tr = document.createElement('tr');
-      tr.id = 'row-' + c.name + '-' + c.server;
+      const updatable = g.containers.filter(canPullUpdate);
+      const anyUpdate = g.containers.some(c => c.updateAvailable);
 
-      const updateCell = c.updateAvailable
-        ? c.canUpdate
-          ? \`<button class="btn-update" onclick="doUpdate('\${c.name}', '\${c.server}', this)">↑ Update</button>\`
-          : \`<span class="update-badge">↑ Yes</span>\`
-        : \`<span class="ok">✓</span>\`;
+      const tagChangeNeeded = g.containers.some(
+        c => c.updateAvailable && c.pullUpdateAvailable === false
+      );
+      const badgeTitle = tagChangeNeeded
+        ? 'Newer release exists, but the image tag pins an older series - change the tag in the compose file to upgrade'
+        : 'Update available, but this container cannot be updated in place';
+      const badgeText = tagChangeNeeded ? '↑ tag change' : '↑ Yes';
 
-      const containerLabel = c.sourceUrl
-        ? \`<a class="container-link" href="\${c.sourceUrl}">\${c.name}</a>\`
-        : \`\${c.name}\`;
+      const countSuffix = g.containers.length > 1 && updatable.length ? \` (\${updatable.length})\` : '';
+      const updateCell = updatable.length
+        ? \`<button class="btn-update" onclick="doUpdate(\${idx}, this)">↑ Update\${countSuffix}</button>\`
+        : anyUpdate
+          ? \`<span class="update-badge" title="\${badgeTitle}">\${badgeText}</span>\`
+          : \`<span class="ok">✓</span>\`;
+
+      const sourceUrl = (g.containers.find(c => c.sourceUrl) || {}).sourceUrl;
+      const label = sourceUrl
+        ? \`<a class="container-link" href="\${esc(sourceUrl)}">\${esc(g.title)}</a>\`
+        : esc(g.title);
+      const members = g.containers.length > 1
+        ? \`<div class="members">\${g.containers.map(c => esc(c.name)).join(', ')}</div>\`
+        : '';
 
       tr.innerHTML = \`
         <td data-label="Container">
-          <div>\${containerLabel}</div>
-          <div class="server">\${c.server}</div>
+          <div>\${label}</div>
+          \${members}
+          <div class="server">\${esc(g.server)}</div>
         </td>
-        <td data-label="Current"><div class='version'>\${c.currentVersion}</div></td>
-        <td data-label="Latest"><div class='version'>\${c.latestVersion}</div></td>
+        <td data-label="Current">\${versionCell(g, 'currentVersion')}</td>
+        <td data-label="Latest">\${versionCell(g, 'latestVersion')}</td>
         <td data-label="Update">\${updateCell}</td>
       \`;
       return tr;
@@ -1591,11 +1890,13 @@ app.get("/dashboard", (req, res) => {
         .then(data => {
           const tbody = document.getElementById('tbody');
           tbody.innerHTML = '';
-          const sorted = data.containers.slice().sort((a, b) => {
-            if (a.updateAvailable === b.updateAvailable) return 0;
-            return a.updateAvailable ? -1 : 1;
+          groups = groupContainers(data.containers).sort((a, b) => {
+            const ua = a.containers.some(c => c.updateAvailable);
+            const ub = b.containers.some(c => c.updateAvailable);
+            if (ua === ub) return 0;
+            return ua ? -1 : 1;
           });
-          sorted.forEach(c => tbody.appendChild(renderRow(c)));
+          groups.forEach((g, i) => tbody.appendChild(renderGroup(g, i)));
         })
         .catch(e => {
           document.getElementById('tbody').innerHTML =
@@ -1603,32 +1904,50 @@ app.get("/dashboard", (req, res) => {
         });
     }
 
-    async function doUpdate(name, server, btn) {
+    // Updates every updatable container of the group, one at a time (they
+    // may share networks/volumes — parallel recreates get racy).
+    async function doUpdate(idx, btn) {
+      const g = groups[idx];
+      if (!g) return;
+      const targets = g.containers.filter(canPullUpdate);
       btn.disabled = true;
-      btn.innerHTML = '<span class="spinner">⟳</span> Updating...';
 
-      try {
-        const res = await fetch(\`\${API_BASE}/update/\${encodeURIComponent(name)}?server=\${encodeURIComponent(server)}\`, {
-          method: 'POST',
-        });
-        const data = await res.json();
-
-        if (!res.ok) {
-          showToast('Error: ' + (data.error || res.statusText), true);
-          btn.disabled = false;
-          btn.innerHTML = '↑ Update';
-          return;
+      let failed = 0;
+      let recreated = 0;
+      for (let i = 0; i < targets.length; i++) {
+        const c = targets[i];
+        btn.innerHTML = targets.length > 1
+          ? \`<span class="spinner">⟳</span> \${i + 1}/\${targets.length}\`
+          : '<span class="spinner">⟳</span> Updating...';
+        try {
+          const res = await fetch(\`\${API_BASE}/update/\${encodeURIComponent(c.name)}?server=\${encodeURIComponent(c.server)}\`, {
+            method: 'POST',
+          });
+          const data = await res.json();
+          if (!res.ok) {
+            failed++;
+            showToast(\`\${c.name}: \${data.error || res.statusText}\`, true);
+          } else if (data.recreated) {
+            recreated++;
+          }
+        } catch (e) {
+          failed++;
+          showToast(\`\${c.name}: \${e.message}\`, true);
         }
-
-        showToast(\`\${name} updated successfully\`);
-
-        // Small delay to let Docker settle after restart
-        setTimeout(loadContainers, 2000);
-      } catch (e) {
-        showToast('Error: ' + e.message, true);
-        btn.disabled = false;
-        btn.innerHTML = '↑ Update';
       }
+
+      if (!failed) {
+        if (!recreated) {
+          // The server pulled but found nothing new (recreated: false).
+          showToast(\`\${g.title}: already up to date - nothing new to pull\`);
+        } else if (targets.length > 1) {
+          showToast(\`\${g.title}: updated \${recreated} of \${targets.length} containers\`);
+        } else {
+          showToast(\`\${g.title} updated successfully\`);
+        }
+      }
+      // Small delay to let Docker settle after restart
+      setTimeout(loadContainers, 2000);
     }
 
     loadContainers();
