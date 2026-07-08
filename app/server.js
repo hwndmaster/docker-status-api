@@ -1085,9 +1085,13 @@ async function resolveContainer(c, onTiming = null) {
 
   // Updates work via the Docker engine API (pull + recreate) so we can
   // refresh anything that's referenced by tag — no compose dir / file
-  // access required. Only digest-pinned images can't be updated, since
-  // there's nothing newer to pull for an immutable reference.
-  const updatable = !image.startsWith("sha256:") && !image.includes("@sha256:");
+  // access required. Digest-pinned images can't be updated (nothing newer
+  // to pull for an immutable reference), and neither can non-running
+  // containers — the stop/remove/recreate flow assumes a running one.
+  const updatable =
+    !image.startsWith("sha256:") &&
+    !image.includes("@sha256:") &&
+    c.State === "running";
 
   let installedVersion = tagVersion;
   let installedFromCreated = false;
@@ -1302,6 +1306,9 @@ async function resolveContainer(c, onTiming = null) {
   return {
     name,
     status: c.State,
+    // Human status line ("Up 3 hours (healthy)", "Exited (1) 2 hours ago")
+    // — the dashboard derives health / exit-code coloring from it.
+    ...(c.Status && { statusText: c.Status }),
     image,
     ...(project && { project }),
     ...(sourceUrl && { sourceUrl }),
@@ -1378,7 +1385,9 @@ app.get("/containers", async (req, res) => {
 
   try {
     const listStart = process.hrtime.bigint();
-    const raw = await dockerRequest("/containers/json");
+    // all=true: stopped/crashed containers stay visible (with a status
+    // dot) instead of silently disappearing from the dashboard.
+    const raw = await dockerRequest("/containers/json?all=true");
     logTiming(
       `[/containers:${requestId}]`,
       "docker-list",
@@ -1451,7 +1460,7 @@ app.get("/containers", async (req, res) => {
 
 app.get("/all-containers", async (req, res) => {
   async function fetchLocal() {
-    const raw = await dockerRequest("/containers/json");
+    const raw = await dockerRequest("/containers/json?all=true");
     const filtered = raw.filter((c) => {
       const name = c.Names[0].replace(/^\//, "");
       return !isExcluded(c.Image, name);
@@ -1654,7 +1663,22 @@ app.get("/dashboard", (req, res) => {
     .container-link:hover { color: #ffffff; text-decoration-color: #86a6de; }
     .server { color: #7a8fff; font-size: 11px; margin-top: 2px; }
     .members { color: #8a97ab; font-size: 11px; margin-top: 2px; }
+    .member { white-space: nowrap; }
     .vname { color: #8da0bf; font-size: 11px; }
+    .status-dot {
+      display: inline-block;
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      margin-right: 6px;
+      vertical-align: middle;
+      flex: none;
+    }
+    .members .status-dot { width: 6px; height: 6px; margin-right: 4px; }
+    .st-green { background: #4caf50; }
+    .st-yellow { background: #ffb300; }
+    .st-red { background: #f44336; }
+    .st-gray { background: #7a7a7a; }
     .ok { color: #4caf50; }
     .update-badge { color: #ff9800; font-weight: bold; }
     .btn-update {
@@ -1837,6 +1861,35 @@ app.get("/dashboard", (req, res) => {
       return \`<div class='versions'>\${lines}</div>\`;
     }
 
+    // Map a container's state (+ health / exit code when present) to a
+    // dot color: green=running, yellow=starting/transitional,
+    // red=faulted, gray=cleanly stopped.
+    function statusColor(c) {
+      const s = (c.status || '').toLowerCase();
+      const text = (c.statusText || '').toLowerCase();
+      if (s === 'running') {
+        if (text.includes('unhealthy')) return 'red';
+        if (text.includes('health: starting')) return 'yellow';
+        return 'green';
+      }
+      if (s === 'restarting' || s === 'created') return 'yellow';
+      if (s === 'dead') return 'red';
+      if (s === 'exited') {
+        const m = /exited \\((\\d+)\\)/.exec(text);
+        const code = m ? parseInt(m[1], 10) : 0;
+        // 130/137/143 = stopped via SIGINT/SIGKILL/SIGTERM (docker stop)
+        return code === 0 || code === 130 || code === 137 || code === 143
+          ? 'gray' : 'red';
+      }
+      return 'gray'; // paused, removing, unknown
+    }
+
+    const STATUS_SEVERITY = { green: 0, gray: 1, yellow: 2, red: 3 };
+
+    function statusDot(color, title) {
+      return \`<span class="status-dot st-\${color}" title="\${esc(title)}"></span>\`;
+    }
+
     // Pulling only helps when the container's own tag has a newer build;
     // old remote servers may not send pullUpdateAvailable yet.
     function canPullUpdate(c) {
@@ -1867,13 +1920,23 @@ app.get("/dashboard", (req, res) => {
       const label = sourceUrl
         ? \`<a class="container-link" href="\${esc(sourceUrl)}">\${esc(g.title)}</a>\`
         : esc(g.title);
+
+      // Group dot shows the worst member status; solo rows show their own.
+      const worst = g.containers.reduce(
+        (acc, c) => STATUS_SEVERITY[statusColor(c)] > STATUS_SEVERITY[acc.color]
+          ? { color: statusColor(c), title: \`\${c.name}: \${c.statusText || c.status}\` }
+          : acc,
+        { color: statusColor(g.containers[0]), title: g.containers[0].statusText || g.containers[0].status }
+      );
       const members = g.containers.length > 1
-        ? \`<div class="members">\${g.containers.map(c => esc(c.name)).join(', ')}</div>\`
+        ? \`<div class="members">\${g.containers
+            .map(c => \`<span class="member">\${statusDot(statusColor(c), c.statusText || c.status)}\${esc(c.name)}</span>\`)
+            .join(', ')}</div>\`
         : '';
 
       tr.innerHTML = \`
         <td data-label="Container">
-          <div>\${label}</div>
+          <div>\${statusDot(worst.color, worst.title)}\${label}</div>
           \${members}
           <div class="server">\${esc(g.server)}</div>
         </td>
@@ -1890,12 +1953,11 @@ app.get("/dashboard", (req, res) => {
         .then(data => {
           const tbody = document.getElementById('tbody');
           tbody.innerHTML = '';
-          groups = groupContainers(data.containers).sort((a, b) => {
-            const ua = a.containers.some(c => c.updateAvailable);
-            const ub = b.containers.some(c => c.updateAvailable);
-            if (ua === ub) return 0;
-            return ua ? -1 : 1;
-          });
+          // Faulted groups first, then groups with updates, then the rest.
+          const rank = g =>
+            (g.containers.some(c => statusColor(c) === 'red') ? 0 : 2) +
+            (g.containers.some(c => c.updateAvailable) ? 0 : 1);
+          groups = groupContainers(data.containers).sort((a, b) => rank(a) - rank(b));
           groups.forEach((g, i) => tbody.appendChild(renderGroup(g, i)));
         })
         .catch(e => {
