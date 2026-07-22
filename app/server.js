@@ -225,7 +225,47 @@ function dockerRequest(path) {
   });
 }
 
-// Generic Docker engine API call with strict status-code checking.
+// GET a Docker engine API path and return the raw response body as a
+// Buffer (for non-JSON endpoints like /logs).
+function dockerRequestRaw(path) {
+  return new Promise((resolve, reject) => {
+    const req = http.request(
+      { socketPath: DOCKER_SOCKET, path, method: "GET" },
+      (res) => {
+        const chunks = [];
+        res.on("data", (c) => chunks.push(c));
+        res.on("end", () =>
+          resolve({ status: res.statusCode, body: Buffer.concat(chunks) })
+        );
+      }
+    );
+    req.on("error", reject);
+    req.end();
+  });
+}
+
+// Docker's /logs endpoint returns a multiplexed stream when the container
+// runs without a TTY: 8-byte frame headers (1B stream type, 3B zero, 4B
+// big-endian payload size) interleaved with the payload. With a TTY it's
+// plain text. Detect framing from the first header and decode accordingly.
+function demuxDockerLogStream(buf) {
+  const looksFramed =
+    buf.length >= 8 &&
+    buf[0] <= 2 &&
+    buf[1] === 0 &&
+    buf[2] === 0 &&
+    buf[3] === 0;
+  if (!looksFramed) return buf.toString("utf8");
+
+  let out = "";
+  let i = 0;
+  while (i + 8 <= buf.length) {
+    const size = buf.readUInt32BE(i + 4);
+    out += buf.slice(i + 8, i + 8 + size).toString("utf8");
+    i += 8 + size;
+  }
+  return out;
+}
 // Returns parsed JSON on success, null for empty 2xx (e.g. 204 from /start).
 // Used for state-changing calls where a 304/4xx/5xx must surface as an error.
 function dockerApi(method, path, body = null, extraHeaders = {}) {
@@ -423,8 +463,41 @@ function httpsGet(url, headers = {}, timeoutMs = REGISTRY_HTTP_TIMEOUT_MS) {
 }
 
 /* ------------------------------------------------------------------ */
-/*  Generic HTTP POST helper (for proxying /update)                   */
+/*  Generic HTTP helpers (for proxying /update and /logs)             */
 /* ------------------------------------------------------------------ */
+
+function httpGetJson(url, timeoutMs = 15000) {
+  return new Promise((resolve, reject) => {
+    const parsed = new URL(url);
+
+    const req = http.request(
+      {
+        hostname: parsed.hostname,
+        port: parsed.port,
+        path: parsed.pathname + parsed.search,
+        method: "GET",
+      },
+      (res) => {
+        let data = "";
+        res.on("data", (chunk) => (data += chunk));
+        res.on("end", () => {
+          try {
+            resolve({ status: res.statusCode, body: JSON.parse(data) });
+          } catch (e) {
+            reject(new Error(`JSON parse error: ${e.message}`));
+          }
+        });
+      }
+    );
+
+    req.setTimeout(timeoutMs, () => {
+      req.destroy();
+      reject(new Error(`Timeout requesting ${url}`));
+    });
+    req.on("error", reject);
+    req.end();
+  });
+}
 
 function httpPost(url) {
   return new Promise((resolve, reject) => {
@@ -1637,6 +1710,221 @@ app.post("/update/:name", async (req, res) => {
 });
 
 /* ------------------------------------------------------------------ */
+/*  /logs/:name — recent container logs (local or proxied to remote)  */
+/* ------------------------------------------------------------------ */
+
+app.get("/logs/:name", async (req, res) => {
+  const { name } = req.params;
+  const { server } = req.query;
+  // Bounded: 1 hour to 7 days, default 24h. tail caps the volume for
+  // chatty containers regardless of the window.
+  const hours = Math.min(parsePositiveInt(req.query.hours, 24), 24 * 7);
+  const TAIL_LINES = 1000;
+
+  if (server && server !== LOCAL_LABEL) {
+    const remote = REMOTE_SERVERS.find((s) => s.label === server);
+    if (!remote) {
+      return res.status(404).json({ error: `Unknown server: ${server}` });
+    }
+    try {
+      const { status, body } = await httpGetJson(
+        `${remote.url}/logs/${encodeURIComponent(name)}?hours=${hours}`
+      );
+      return res.status(status).json(body);
+    } catch (e) {
+      return res.status(502).json({
+        error: `Failed to proxy logs from ${remote.label}: ${e.message}`,
+      });
+    }
+  }
+
+  try {
+    // all=true so logs of stopped/crashed containers stay reachable —
+    // that's exactly when they're most interesting.
+    const containers = await dockerRequest("/containers/json?all=true");
+    const c = containers.find((c) =>
+      c.Names.some((n) => n.replace(/^\//, "") === name)
+    );
+    if (!c) return res.status(404).json({ error: `Container not found: ${name}` });
+
+    const since = Math.floor(Date.now() / 1000) - hours * 3600;
+    const { status, body } = await dockerRequestRaw(
+      `/containers/${c.Id}/logs?stdout=true&stderr=true&timestamps=true` +
+        `&since=${since}&tail=${TAIL_LINES}`
+    );
+    if (status !== 200) {
+      return res.status(502).json({ error: `Docker logs request → HTTP ${status}` });
+    }
+
+    // Trim RFC3339 nanosecond timestamps down to seconds for readability.
+    const logs = demuxDockerLogStream(body).replace(
+      /^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})\.\d+Z?\s?/gm,
+      "$1 "
+    );
+
+    res.json({ name, hours, tail: TAIL_LINES, logs });
+  } catch (err) {
+    console.error(`[logs] ${name}: ${err.message}`);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/* ------------------------------------------------------------------ */
+/*  /start | /stop | /restart /:name — container lifecycle control    */
+/* ------------------------------------------------------------------ */
+
+// The three lifecycle endpoints are identical apart from the Docker engine
+// path they hit, so they're built from one factory. They mirror the
+// remote-proxy pattern used by /update and /logs, and reuse dockerApi()
+// (the same helper /update already uses to stop/start during a recreate).
+function makeLifecycleHandler(verb, dockerPath) {
+  return async (req, res) => {
+    const { name } = req.params;
+    const { server } = req.query;
+
+    // Remote target → proxy. We call the remote WITHOUT a server param so it
+    // treats the request as local, exactly like the /update proxy does.
+    if (server && server !== LOCAL_LABEL) {
+      const remote = REMOTE_SERVERS.find((s) => s.label === server);
+      if (!remote) {
+        return res.status(404).json({ error: `Unknown server: ${server}` });
+      }
+      try {
+        const { status, body } = await httpPost(
+          `${remote.url}/${verb}/${encodeURIComponent(name)}`
+        );
+        return res.status(status).json(body);
+      } catch (e) {
+        return res.status(502).json({
+          error: `Failed to proxy ${verb} to ${remote.label}: ${e.message}`,
+        });
+      }
+    }
+
+    try {
+      // all=true so a stopped container is still findable (needed for /start).
+      const containers = await dockerRequest("/containers/json?all=true");
+      const c = containers.find((c) =>
+        c.Names.some((n) => n.replace(/^\//, "") === name)
+      );
+      if (!c) return res.status(404).json({ error: `Container not found: ${name}` });
+
+      try {
+        await dockerApi("POST", `/containers/${c.Id}${dockerPath}`);
+        return res.json({ ok: true, name, action: verb });
+      } catch (e) {
+        // 304 = already started (start) / already stopped (stop): benign no-op.
+        if (e.statusCode === 304) {
+          return res.json({ ok: true, name, action: verb, noop: true });
+        }
+        throw e;
+      }
+    } catch (err) {
+      console.error(`[${verb}] ${name}: ${err.message}`);
+      return res.status(500).json({ error: err.message });
+    }
+  };
+}
+
+app.post("/start/:name", makeLifecycleHandler("start", "/start"));
+app.post("/stop/:name", makeLifecycleHandler("stop", "/stop?t=10"));
+app.post("/restart/:name", makeLifecycleHandler("restart", "/restart?t=10"));
+
+/* ------------------------------------------------------------------ */
+/*  /logs-view/:name — standalone log window (opened via window.open) */
+/* ------------------------------------------------------------------ */
+
+// The dashboard is embedded as an iframe inside Dashy, so an in-page modal
+// gets clipped to the iframe. Logs instead open in a real separate window
+// pointed at this route. Being same-origin as /dashboard, the page can
+// fetch the existing /logs endpoint itself (with a refresh + time window).
+app.get("/logs-view/:name", (req, res) => {
+  const name = req.params.name;
+  const server = typeof req.query.server === "string" ? req.query.server : "";
+
+  const htmlEsc = (s) =>
+    String(s).replace(
+      /[&<>"']/g,
+      (ch) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[ch])
+    );
+  // Inject as JS string literals; escape "<" so a "</script>" inside a value
+  // can't break out of the inline script.
+  const jsName = JSON.stringify(name).replace(/</g, "\\u003c");
+  const jsServer = JSON.stringify(server).replace(/</g, "\\u003c");
+  const titleText = htmlEsc(server ? `${name} @ ${server}` : name);
+
+  res.send(`<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>${titleText} — logs</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: sans-serif; background: #16191f; color: #cdd6e4; height: 100vh; display: flex; flex-direction: column; }
+    header { display: flex; align-items: center; gap: 10px; padding: 8px 12px; border-bottom: 1px solid #2a3342; flex: none; }
+    header .title { font-size: 13px; color: #cdd6e4; margin-right: auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    header select, header button {
+      background: #222a36; color: #cdd6e4; border: 1px solid #37415280;
+      border-radius: 4px; padding: 3px 10px; font-size: 12px; cursor: pointer;
+    }
+    header button:hover, header select:hover { border-color: #86a6de; color: #fff; }
+    pre {
+      flex: 1; margin: 0; padding: 10px 12px; overflow: auto;
+      font-size: 11px; line-height: 1.5; color: #c4cbd8;
+      white-space: pre-wrap; overflow-wrap: anywhere;
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <span class="title">${titleText}</span>
+    <select id="hours" title="Time window">
+      <option value="1">1h</option>
+      <option value="6">6h</option>
+      <option value="24" selected>24h</option>
+      <option value="168">7d</option>
+    </select>
+    <button id="refresh">Refresh</button>
+  </header>
+  <pre id="log">Loading...</pre>
+  <script>
+    var NAME = ${jsName};
+    var SERVER = ${jsServer};
+    var pre = document.getElementById('log');
+    var hoursSel = document.getElementById('hours');
+    document.title = (SERVER ? NAME + ' @ ' + SERVER : NAME) + ' — logs';
+
+    function load() {
+      pre.textContent = 'Loading...';
+      var url = '/logs/' + encodeURIComponent(NAME) +
+        '?server=' + encodeURIComponent(SERVER) +
+        '&hours=' + encodeURIComponent(hoursSel.value);
+      fetch(url).then(function (r) {
+        return r.json().then(function (data) {
+          return { ok: r.ok, statusText: r.statusText, data: data };
+        });
+      }).then(function (res) {
+        if (!res.ok) {
+          pre.textContent = 'Error: ' + (res.data.error || res.statusText);
+          return;
+        }
+        pre.textContent = res.data.logs || '(no log output in the selected window)';
+        pre.scrollTop = pre.scrollHeight;
+      }).catch(function (e) {
+        pre.textContent = 'Error: ' + e.message;
+      });
+    }
+
+    document.getElementById('refresh').addEventListener('click', load);
+    hoursSel.addEventListener('change', load);
+    load();
+  </script>
+</body>
+</html>`);
+});
+
+/* ------------------------------------------------------------------ */
 /*  /dashboard — inline HTML widget for Dashy iframe                  */
 /* ------------------------------------------------------------------ */
 
@@ -1653,14 +1941,21 @@ app.get("/dashboard", (req, res) => {
     th { text-align: left; padding: 6px 8px; color: #888; font-weight: normal; border-bottom: 1px solid #333; }
     td { padding: 6px 8px; border-bottom: 1px solid #222; vertical-align: middle; }
     tr:hover td { background: #ffffff08; }
-    .container-link {
+    .container-title {
       color: inherit;
-      text-decoration: underline;
-      text-decoration-thickness: 1px;
-      text-decoration-color: #4b648f;
-      text-underline-offset: 2px;
+      cursor: pointer;
+      user-select: none;
     }
-    .container-link:hover { color: #ffffff; text-decoration-color: #86a6de; }
+    .container-title::before {
+      content: '▸';
+      display: inline-block;
+      margin-right: 5px;
+      color: #6b7a95;
+      font-size: 10px;
+    }
+    .container-title:hover { color: #ffffff; }
+    .container-title:hover::before { color: #86a6de; }
+    .container-title.expanded::before { content: '▾'; }
     .server { color: #7a8fff; font-size: 11px; margin-top: 2px; }
     .members { color: #8a97ab; font-size: 11px; margin-top: 2px; }
     .member { white-space: nowrap; }
@@ -1679,6 +1974,42 @@ app.get("/dashboard", (req, res) => {
     .st-yellow { background: #ffb300; }
     .st-red { background: #f44336; }
     .st-gray { background: #7a7a7a; }
+    .detail-row { display: none; }
+    .detail-row.open { display: table-row; }
+    .detail-row > td { background: #0f1218; border-bottom: 1px solid #222; }
+    .detail-panel {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 8px;
+      padding: 4px 2px;
+    }
+    .detail-panel .sep {
+      width: 1px;
+      align-self: stretch;
+      background: #2a3342;
+      margin: 2px 4px;
+    }
+    .btn-cmd {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      background: #222a36;
+      color: #cdd6e4;
+      border: 1px solid #37415280;
+      border-radius: 4px;
+      padding: 3px 10px;
+      font-size: 12px;
+      cursor: pointer;
+      text-decoration: none;
+      white-space: nowrap;
+    }
+    .btn-cmd:hover { border-color: #86a6de; color: #fff; }
+    .btn-cmd:disabled { opacity: 0.4; cursor: not-allowed; border-color: #37415280; color: #cdd6e4; }
+    .btn-start:not(:disabled) { border-color: #4caf5080; color: #7fd684; }
+    .btn-start:not(:disabled):hover { border-color: #4caf50; color: #b6f0b9; }
+    .btn-stop:not(:disabled) { border-color: #f4433680; color: #ef8a82; }
+    .btn-stop:not(:disabled):hover { border-color: #f44336; color: #ffb0aa; }
     .ok { color: #4caf50; }
     .update-badge { color: #ff9800; font-weight: bold; }
     .btn-update {
@@ -1796,6 +2127,13 @@ app.get("/dashboard", (req, res) => {
       .btn-update {
         padding: 4px 10px;
       }
+
+      /* Detail row is its own block-level card in the mobile layout; pull it
+         up so it reads as attached to the row it expands. */
+      .detail-row.open { display: block; margin-top: -6px; }
+      .detail-panel { align-items: stretch; }
+      .detail-panel .sep { display: none; }
+      .btn-cmd { justify-content: center; flex: 1 1 auto; }
     }
   </style>
 </head>
@@ -1890,13 +2228,109 @@ app.get("/dashboard", (req, res) => {
       return \`<span class="status-dot st-\${color}" title="\${esc(title)}"></span>\`;
     }
 
+    // Container names are [a-zA-Z0-9_.-], so embedding them in the inline
+    // onclick handlers below is safe once HTML-escaped.
+
+    // Clicking a row's title toggles the supplemental detail row beneath it.
+    function toggleDetail(idx, el) {
+      const row = document.getElementById('detail-' + idx);
+      if (!row) return;
+      el.classList.toggle('expanded', row.classList.toggle('open'));
+    }
+
+    // Logs open in a real separate window — the dashboard is an iframe inside
+    // Dashy, so an in-page panel would be clipped. One window per container,
+    // reused/focused on repeat clicks via a stable window name.
+    function openLogs(name, server) {
+      const url = \`\${API_BASE}/logs-view/\${encodeURIComponent(name)}?server=\${encodeURIComponent(server)}\`;
+      const winName = 'logs_' + (name + '_' + server).replace(/[^a-zA-Z0-9_]/g, '_');
+      const w = window.open(url, winName, 'width=1000,height=720,scrollbars=yes,resizable=yes');
+      if (w) w.focus();
+      else showToast('Popup blocked — allow pop-ups for this dashboard', true);
+    }
+
+    // Whole-project lifecycle action. start → non-running members;
+    // stop → running members; restart → all members. Sequential, because a
+    // stack's members share networks/volumes and parallel changes get racy
+    // (same reason doUpdate is sequential).
+    async function groupAction(idx, action, btn) {
+      const g = groups[idx];
+      if (!g) return;
+      const targets = action === 'start'
+        ? g.containers.filter(c => c.status !== 'running')
+        : action === 'stop'
+          ? g.containers.filter(c => c.status === 'running')
+          : g.containers.slice();
+      if (!targets.length) return;
+
+      const panel = btn.closest('.detail-panel');
+      const buttons = panel ? [...panel.querySelectorAll('button')] : [btn];
+      buttons.forEach(b => b.disabled = true);
+
+      let failed = 0;
+      for (let i = 0; i < targets.length; i++) {
+        const c = targets[i];
+        btn.innerHTML = targets.length > 1
+          ? \`<span class="spinner">⟳</span> \${i + 1}/\${targets.length}\`
+          : '<span class="spinner">⟳</span>';
+        try {
+          const res = await fetch(\`\${API_BASE}/\${action}/\${encodeURIComponent(c.name)}?server=\${encodeURIComponent(c.server)}\`, {
+            method: 'POST',
+          });
+          const data = await res.json();
+          if (!res.ok) {
+            failed++;
+            showToast(\`\${c.name}: \${data.error || res.statusText}\`, true);
+          }
+        } catch (e) {
+          failed++;
+          showToast(\`\${c.name}: \${e.message}\`, true);
+        }
+      }
+
+      if (!failed) {
+        const verb = action === 'start' ? 'started' : action === 'stop' ? 'stopped' : 'restarted';
+        showToast(\`\${g.title} \${verb}\`);
+      }
+      // Let Docker settle, then refresh (rebuilds rows, collapsing the panel).
+      setTimeout(loadContainers, 1500);
+    }
+
     // Pulling only helps when the container's own tag has a newer build;
     // old remote servers may not send pullUpdateAvailable yet.
     function canPullUpdate(c) {
       return (c.pullUpdateAvailable !== undefined ? c.pullUpdateAvailable : c.updateAvailable) && c.canUpdate;
     }
 
+    // The expanded panel: whole-project lifecycle controls, the official-site
+    // link (moved here from the title), and one log button per container.
+    function detailPanel(g, idx) {
+      const anyRunning = g.containers.some(c => c.status === 'running');
+      const anyStopped = g.containers.some(c => c.status !== 'running');
+
+      const cmd = (action, text, cls, enabled) =>
+        \`<button class="btn-cmd \${cls}"\${enabled ? '' : ' disabled'} onclick="groupAction(\${idx}, '\${action}', this)">\${text}</button>\`;
+
+      const controls = [
+        cmd('start', '▶ Start', 'btn-start', anyStopped),
+        cmd('stop', '■ Stop', 'btn-stop', anyRunning),
+        cmd('restart', '⟳ Restart', 'btn-restart', g.containers.length > 0),
+      ].join('');
+
+      const sourceUrl = (g.containers.find(c => c.sourceUrl) || {}).sourceUrl;
+      const linkBtn = sourceUrl
+        ? \`<span class="sep"></span><a class="btn-cmd" href="\${esc(sourceUrl)}" target="_blank" rel="noopener">🔗 Open site</a>\`
+        : '';
+
+      const logBtns = g.containers
+        .map(c => \`<button class="btn-cmd" onclick="openLogs('\${esc(c.name)}', '\${esc(c.server)}')">📄 Log \${esc(c.name)}</button>\`)
+        .join('');
+
+      return \`<div class="detail-panel">\${controls}\${linkBtn}<span class="sep"></span>\${logBtns}</div>\`;
+    }
+
     function renderGroup(g, idx) {
+      const frag = document.createDocumentFragment();
       const tr = document.createElement('tr');
       const updatable = g.containers.filter(canPullUpdate);
       const anyUpdate = g.containers.some(c => c.updateAvailable);
@@ -1916,10 +2350,9 @@ app.get("/dashboard", (req, res) => {
           ? \`<span class="update-badge" title="\${badgeTitle}">\${badgeText}</span>\`
           : \`<span class="ok">✓</span>\`;
 
-      const sourceUrl = (g.containers.find(c => c.sourceUrl) || {}).sourceUrl;
-      const label = sourceUrl
-        ? \`<a class="container-link" href="\${esc(sourceUrl)}">\${esc(g.title)}</a>\`
-        : esc(g.title);
+      // Title is now a click-to-expand toggle; the official link moves into
+      // the detail panel below.
+      const label = \`<span class="container-title" onclick="toggleDetail(\${idx}, this)">\${esc(g.title)}</span>\`;
 
       // Group dot shows the worst member status; solo rows show their own.
       const worst = g.containers.reduce(
@@ -1944,7 +2377,15 @@ app.get("/dashboard", (req, res) => {
         <td data-label="Latest">\${versionCell(g, 'latestVersion')}</td>
         <td data-label="Update">\${updateCell}</td>
       \`;
-      return tr;
+
+      const detail = document.createElement('tr');
+      detail.className = 'detail-row';
+      detail.id = 'detail-' + idx;
+      detail.innerHTML = \`<td colspan="4">\${detailPanel(g, idx)}</td>\`;
+
+      frag.appendChild(tr);
+      frag.appendChild(detail);
+      return frag;
     }
 
     function loadContainers() {
